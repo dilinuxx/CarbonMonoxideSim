@@ -1,0 +1,3 @@
+/Users/admin/Documents/bc/build/CMakeFiles/CarbonMonoxideSim.dir
+/Users/admin/Documents/bc/build/CMakeFiles/edit_cache.dir
+/Users/admin/Documents/bc/build/CMakeFiles/rebuild_cache.dir
