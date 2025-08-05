@@ -218,5 +218,6 @@ mlmodel = ct.convert(
     model,
     inputs=[ct.TensorType(shape=(1, X_train.shape[1], X_train.shape[2]))]
 )
+
 mlmodel.save("co_lstm_regression_v1.mlmodel")
 print("✅ Exported to CoreML: co_lstm_regression_v1.mlmodel")
