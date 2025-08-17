@@ -30,6 +30,14 @@ Install the following libraries with the specified versions for compatibility:
     pip install scikit-learn==1.1.2
     pip install numpy==1.24.3
     pip install matplotlib
+    pip install tensorflow
+    pip install pandas
+
+    OR
+
+    pip install coremltools==6.3.0 scikit-learn==1.1.2 numpy==1.24.3 matplotlib tensorflow pandas
+
+
 
 IMPORTANT:
 ----------
