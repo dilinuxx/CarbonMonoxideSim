@@ -25,7 +25,7 @@ python -m venv lstm_api_env
 source lstm_api_env/bin/activate
 
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r README.txt
 
 nohup uvicorn app:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
 

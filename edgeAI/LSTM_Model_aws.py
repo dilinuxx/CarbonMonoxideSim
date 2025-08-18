@@ -12,6 +12,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.losses import MeanSquaredError
 
 
 # --- Step 1: Load and preprocess data ---
@@ -83,7 +84,8 @@ model = Sequential([
 ])
 
 optimizer = Adam(learning_rate=0.001)
-model.compile(optimizer=optimizer, loss='mse')
+#model.compile(optimizer=optimizer, loss='mse')
+model.compile(optimizer=optimizer, loss=MeanSquaredError())
 
 # --- Step 8: Custom callback to print and store RMSE, MAE, R2 per epoch ---
 class MetricsCallback(tf.keras.callbacks.Callback):

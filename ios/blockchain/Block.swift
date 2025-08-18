@@ -31,3 +31,13 @@ class Block: Codable {
         return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
 }
+
+extension Block {
+    func toDictionaryData() -> Data? {
+        try? JSONEncoder().encode(data)
+    }
+
+    static func fromDictionaryData(_ data: Data) -> [String: AnyCodable]? {
+        try? JSONDecoder().decode([String: AnyCodable].self, from: data)
+    }
+}

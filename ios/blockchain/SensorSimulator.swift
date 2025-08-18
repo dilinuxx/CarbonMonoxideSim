@@ -23,6 +23,9 @@ class SensorSimulator {
     private var latestClassification: String = "pending"
     var eventCallback: ((SensorEvent) -> Void)?
     
+    // BLE Communication
+    private let blePeripheralManager = BLEPeripheralManager()
+    
     // Energy Consumption
     private let logger = OSLog(subsystem: "com.cosim.project", category: .pointsOfInterest)
 
@@ -115,10 +118,28 @@ class SensorSimulator {
         let blockData = updatedEvent.toBlockData()
         blockchain.addBlock(data: blockData)
         contract.execute(event: blockData)
+        
+        //
+        //blockchain.printChain()
+        
+        //
+        propagateBLEData(event: updatedEvent)
 
         // --- Notify UI/listeners ---
         eventCallback?(updatedEvent)
     }
+    
+    func propagateBLEData(event: SensorEvent) {
+        let deviceID: UInt32 = 0x12345678 // your device ID
+        let payload = event.toCompactPayload(deviceID: deviceID)
+
+        if event.COppm >= ALERT_THRESHOLD {
+            blePeripheralManager.startAdvertising(with: payload)
+        } else {
+            blePeripheralManager.stopAdvertising()
+        }
+    }
+
 
 
 
