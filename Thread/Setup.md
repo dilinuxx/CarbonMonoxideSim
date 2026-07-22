@@ -1,84 +1,344 @@
-------------------------------
-## ESP32-H2 OpenThread CLI Bring-Up Guide
-This repository contains the documentation and steps required to bring up an ESP32-H2 development board using the ESP-IDF framework and the OpenThread CLI example.
-The ESP32-H2 features an integrated IEEE 802.15.4 radio, making it a low-power, cost-effective node for building Thread mesh networks without relying on resident Wi-Fi infrastructure.
-------------------------------
+# ESP32-H2 OpenThread CLI Bring-Up Guide
+
+This repository documents the process of building, flashing, and running the native OpenThread CLI example on an **ESP32-H2** development board using **ESP-IDF v5.2**.
+
+The ESP32-H2 features an integrated IEEE 802.15.4 radio, making it an ideal platform for developing **Thread mesh networking** applications.
+
+---
+
+## Features
+
+- Build the native OpenThread CLI example
+- Flash firmware to an ESP32-H2
+- Create a standalone Thread mesh network
+- Verify Thread Leader operation
+- Troubleshooting common ESP-IDF and serial connection issues
+
+---
+
 ## Hardware Requirements
 
-* ESP32-H2 Development Board (e.g., ESP32-H2-DevKitM-1, Olimex ESPH2-DevKit-LiPo)
-* USB-C Data Cable
-* Host Machine (Linux, macOS, or Windows with ESP-IDF installed)
+- ESP32-H2 Development Board
+- USB Data Cable
+- Computer running macOS, Linux, or Windows
+- ESP-IDF v5.2 or later
 
-------------------------------
-## Environment Setup
-Ensure your ESP-IDF environment is properly installed and sourced. This guide targets ESP-IDF v5.2 or later.
+---
 
-# Source the ESP-IDF environment tools
-. $HOME/esp/esp-idf/export.sh
-# Verify your installation version
+## Software Requirements
+
+- ESP-IDF v5.2+
+- Python 3.x
+- Git
+
+Verify your ESP-IDF installation:
+
+```bash
 idf.py --version
+```
 
-Expected Output: ESP-IDF v5.2.x (or newer)
-------------------------------
-## Building the OpenThread CLI Application
-We use the native ot_cli example provided inside the ESP-IDF directory tree.
+Expected output:
 
-# Navigate to the OpenThread CLI example directory
-cd $IDF_PATH/examples/openthread/ot_cli
-# Set the build target explicitly to the ESP32-H2 chip architectural type
+```
+ESP-IDF v5.2.x
+```
+
+---
+
+# Environment Setup
+
+Source the ESP-IDF environment before using `idf.py`.
+
+```bash
+cd ~/esp
+source esp-idf/export.sh
+```
+
+---
+
+# Build the OpenThread CLI Example
+
+Navigate to the OpenThread example:
+
+```bash
+cd ~/esp/esp-idf/examples/openthread/ot_cli
+```
+
+Select the ESP32-H2 target:
+
+```bash
 idf.py set-target esp32h2
-# Compile the firmware binaries
+```
+
+Build the project:
+
+```bash
 idf.py build
+```
 
-Once compilation finishes successfully, you will see a Project build complete confirmation message on your terminal.
-------------------------------
-## Flashing & Monitoring
-Connect your ESP32-H2 board to your computer using the USB port.
-## 1. Identify the Serial Port
-Identify your connected device port mapping name:
+When complete you should see:
 
-* macOS: ls /dev/cu.usbmodem* or ls /dev/cu.usbserial*
-* Linux: ls /dev/ttyACM* or ls /dev/ttyUSB*
+```
+Project build complete.
+```
 
-## 2. Flash Firmware and Launch Monitor
-Replace /dev/cu.usbmodem1101 with your actual device port string:
+---
 
-idf.py -p /dev/cu.usbmodem1101 flash monitor
+# Flash the Firmware
 
-------------------------------
-## Operating the OpenThread CLI
-Once the device boots up and the monitor establishes a connection, press Enter to see the OpenThread command-line prompt (>).
-## Verify Firmware Status
+Identify your serial device.
 
+### macOS
+
+```bash
+ls /dev/cu.usbserial*
+```
+
+or
+
+```bash
+ls /dev/cu.usbmodem*
+```
+
+### Linux
+
+```bash
+ls /dev/ttyUSB*
+```
+
+or
+
+```bash
+ls /dev/ttyACM*
+```
+
+Flash the firmware:
+
+```bash
+idf.py -p <serial-port> flash
+```
+
+Example:
+
+```bash
+idf.py -p /dev/cu.usbserial-110 flash
+```
+
+---
+
+# Open the Serial Monitor
+
+```bash
+idf.py -p <serial-port> monitor
+```
+
+Example:
+
+```bash
+idf.py -p /dev/cu.usbserial-110 monitor
+```
+
+After booting, the OpenThread CLI prompt appears:
+
+```
+>
+```
+
+---
+
+# Verify the Firmware
+
+Check the firmware version:
+
+```
 > version
-OPENTHREAD/1.3.0; esp32h2; Jul 22 2026 
-Done
+```
 
+Check the Thread state:
+
+```
 > state
+```
+
+Expected:
+
+```
 disabled
 Done
+```
 
-## Initialise and Start a New Thread Mesh Network
-Run the following configuration sequence to commit a network dataset operational profile and start the stack:
+---
 
-# 1. Generate a new randomized operational dataset configuration 
+# Create a New Thread Network
+
+Generate a new operational dataset:
+
+```
 > dataset init new
-Done
-# 2. Commit this dataset instance as active configuration memory
+```
+
+Commit the dataset:
+
+```
 > dataset commit active
-Done
-# 3. Bring up the network interface layer
+```
+
+Bring up the network interface:
+
+```
 > ifconfig up
-Done
-# 4. Enable the local Thread stack operations
+```
+
+Start Thread:
+
+```
 > thread start
-Done
+```
 
-## Verify Network State
-Wait 3–5 seconds for network negotiations to finish, then poll the node state status:
+Wait a few seconds and verify the node state:
 
+```
 > state
+```
+
+Expected output:
+
+```
 leader
 Done
+```
 
-The node will automatically upgrade its structural mesh state assignment to leader, indicating that your standalone micro-mesh network backbone structure is operational.
+The ESP32-H2 is now acting as the **Leader** of a new Thread mesh network.
+
+---
+
+# View Network Information
+
+Network Name
+
+```
+> networkname
+```
+
+PAN ID
+
+```
+> panid
+```
+
+Extended PAN ID
+
+```
+> extpanid
+```
+
+IPv6 Addresses
+
+```
+> ipaddr
+```
+
+---
+
+# Troubleshooting
+
+## CMakeLists.txt not found
+
+If you see:
+
+```
+CMakeLists.txt not found in project directory
+```
+
+Ensure you are inside the OpenThread example directory:
+
+```bash
+cd ~/esp/esp-idf/examples/openthread/ot_cli
+```
+
+---
+
+## Serial Port Busy
+
+If the serial port is busy:
+
+```
+Resource busy
+```
+
+Determine which process owns the port:
+
+```bash
+lsof /dev/cu.usbserial-110
+```
+
+Terminate the process:
+
+```bash
+kill <PID>
+```
+
+Restart the monitor:
+
+```bash
+idf.py -p /dev/cu.usbserial-110 monitor
+```
+
+---
+
+## Device Not Configured
+
+If the monitor disconnects with:
+
+```
+Device not configured
+```
+
+This is typically caused by:
+
+- USB cable disconnection
+- Board reset
+- USB-UART reset
+- Temporary power interruption
+
+Reconnect the device and restart the monitor.
+
+---
+
+## Flash Size Warning
+
+If you see:
+
+```
+Detected size(4096k) larger than the size in the binary image header(2048k)
+```
+
+Your development board contains a 4 MB flash chip while the firmware was built for a 2 MB flash layout. The example still runs correctly, but production builds should be configured for the correct flash size.
+
+---
+
+# Expected Result
+
+A successful bring-up should produce:
+
+```
+> state
+leader
+
+> networkname
+OpenThread
+
+> panid
+0x9b5c
+
+> ipaddr
+fdde:ad00:beef:...
+```
+
+Your ESP32-H2 is now operating as the **Leader** of a Thread mesh network and is ready for additional Thread devices to join.
+
+---
+
+# License
+
+This project is released under the MIT License.
