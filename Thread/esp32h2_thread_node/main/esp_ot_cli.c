@@ -60,7 +60,7 @@ static led_strip_handle_t led_strip;
 //
 #define THREAD_TELEMETRY_PORT 55311
 #define TELEMETRY_INTERVAL_MS 10000
-#define THREAD_BORDER_ROUTER_IPV6 "fdde:ad00:beef:0:2254:2255:fcbf:2241"
+#define THREAD_BORDER_ROUTER_IPV6 "fdde:ad00:beef:0:6156:1314:fcbf:27b6"
 #define DEVICE_ID "CBP-00400"
 
 #define TAG "ot_esp_cli"
@@ -359,6 +359,45 @@ static void ot_task_worker(void *aContext)
     openthread_netif = init_openthread_netif(&config);
     esp_netif_set_default_netif(openthread_netif);
 
+#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+    esp_cli_custom_command_init();
+#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+
+    // Run the main loop
+#if CONFIG_OPENTHREAD_CLI
+    esp_openthread_cli_create_task();
+#endif
+    // =====================================================
+    // START THREAD AUTOMATICALLY
+    // =====================================================
+    otOperationalDatasetTlvs dataset;
+
+    otError error =
+        otDatasetGetActiveTlvs(
+            esp_openthread_get_instance(),
+            &dataset
+        );
+
+    if (error == OT_ERROR_NONE) {
+
+        ESP_LOGI(
+            TAG,
+            "Starting Thread with stored Active Dataset"
+        );
+
+        ESP_ERROR_CHECK(
+            esp_openthread_auto_start(&dataset)
+        );
+
+    } else {
+
+        ESP_LOGE(
+            TAG,
+            "No Active Thread Dataset: %d",
+            error
+        );
+    }
+
     xTaskCreate(
         telemetry_task,
         "telemetry_task",
@@ -368,19 +407,6 @@ static void ot_task_worker(void *aContext)
         NULL
     );
 
-#if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-    esp_cli_custom_command_init();
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-
-    // Run the main loop
-#if CONFIG_OPENTHREAD_CLI
-    esp_openthread_cli_create_task();
-#endif
-#if CONFIG_OPENTHREAD_AUTO_START
-    otOperationalDatasetTlvs dataset;
-    otError error = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &dataset);
-    ESP_ERROR_CHECK(esp_openthread_auto_start((error == OT_ERROR_NONE) ? &dataset : NULL));
-#endif
     esp_openthread_launch_mainloop();
 
     // Clean up
