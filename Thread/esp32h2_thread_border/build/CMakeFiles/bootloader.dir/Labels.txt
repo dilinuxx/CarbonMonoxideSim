@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/admin/esp/esp32h2_thread_border/build/CMakeFiles/bootloader
+/Users/admin/esp/esp32h2_thread_border/build/CMakeFiles/bootloader.rule
+/Users/admin/esp/esp32h2_thread_border/build/CMakeFiles/bootloader-complete.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/admin/esp/esp32h2_thread_border/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
