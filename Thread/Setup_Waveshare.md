@@ -414,3 +414,370 @@ state
 ```
 
 This setup deliberately keeps **firmware flashing/debugging** and the **OpenThread CLI UART console** on their respective interfaces.
+
+Yes. I would append a **“Board Bring-Up Sequence”** section, but I’d update the port names to the ones we actually confirmed today:
+
+* Flash: `/dev/cu.usbmodem11422401`
+* CLI monitor: `/dev/cu.usbmodem59710005001`
+
+Also, because we discovered that `dataset init new` alone isn't enough, the README should explicitly document the **dataset → commit → interface → Thread start** sequence.
+
+### Append this to the README
+
+````markdown
+## Board Bring-Up Sequence
+
+After successfully building the firmware, use the following sequence to
+bring up the ESP32-H2 and form a new Thread network.
+
+### 1. Build the firmware
+
+From the project directory:
+
+```bash
+cd ~/esp/esp32h2_thread
+idf.py build
+````
+
+A successful build ends with:
+
+```text
+Project build complete.
+```
+
+### 2. Flash the ESP32-H2
+
+Use the native USB JTAG/Serial interface:
+
+```bash
+idf.py -p /dev/cu.usbmodem11422401 flash
+```
+
+The flash interface and the OpenThread CLI interface are separate USB
+interfaces.
+
+### 3. Open the OpenThread CLI monitor
+
+The OpenThread CLI is connected to the separate USB-UART interface:
+
+```bash
+idf.py -p /dev/cu.usbmodem59710005001 monitor
+```
+
+Wait for the CLI prompt:
+
+```text
+>
+```
+
+The application may initially report:
+
+```text
+Thread not attached yet, telemetry waiting...
+```
+
+This is expected while Thread is disabled.
+
+### 4. Check the initial Thread state
+
+At the `>` prompt:
+
+```text
+state
+```
+
+A newly booted device may report:
+
+```text
+disabled
+Done
+```
+
+This means the OpenThread stack is running but the Thread interface has
+not yet been started.
+
+### 5. Create a new Thread dataset
+
+For a new Thread network:
+
+```text
+dataset init new
+```
+
+Expected:
+
+```text
+Done
+```
+
+At this point a dataset has been generated, but it is not necessarily
+the active operational dataset yet.
+
+### 6. Commit the dataset
+
+Commit the generated dataset as the active operational dataset:
+
+```text
+dataset commit active
+```
+
+Expected:
+
+```text
+Done
+```
+
+The active dataset can be inspected with:
+
+```text
+dataset active -x
+```
+
+This should now return a hexadecimal Thread Operational Dataset rather
+than:
+
+```text
+Error 23: NotFound
+```
+
+### 7. Bring up the IPv6 interface
+
+Before starting Thread:
+
+```text
+ifconfig up
+```
+
+Expected:
+
+```text
+Done
+```
+
+### 8. Start Thread
+
+Start the Thread protocol:
+
+```text
+thread start
+```
+
+Expected:
+
+```text
+Done
+```
+
+If `thread start` returns:
+
+```text
+Error 13: InvalidState
+```
+
+check that:
+
+```text
+dataset active -x
+```
+
+returns a valid dataset and that:
+
+```text
+ifconfig up
+```
+
+has been executed.
+
+### 9. Check the Thread role
+
+Run:
+
+```text
+state
+```
+
+Give the device several seconds to attach/form the network.
+
+For the first device forming a new Thread network, the expected final
+state is typically:
+
+```text
+leader
+Done
+```
+
+Other roles, such as:
+
+```text
+router
+child
+```
+
+may be reported when the device joins an existing Thread network.
+
+### 10. Verify the network configuration
+
+Useful commands:
+
+```text
+dataset
+```
+
+```text
+dataset active -x
+```
+
+```text
+channel
+```
+
+```text
+panid
+```
+
+```text
+extpanid
+```
+
+```text
+networkname
+```
+
+```text
+ipaddr
+```
+
+```text
+state
+```
+
+### Minimal first-boot sequence
+
+For a completely new Thread network, the essential CLI sequence is:
+
+```text
+dataset init new
+dataset commit active
+ifconfig up
+thread start
+state
+```
+
+A successful first-node bring-up should eventually look approximately like:
+
+```text
+> dataset init new
+Done
+
+> dataset commit active
+Done
+
+> ifconfig up
+Done
+
+> thread start
+Done
+
+> state
+leader
+Done
+```
+
+### Important: do not omit `dataset commit active`
+
+This is an important part of the bring-up procedure.
+
+Running only:
+
+```text
+dataset init new
+thread start
+```
+
+can result in:
+
+```text
+Error 13: InvalidState
+```
+
+The generated dataset should first be committed:
+
+```text
+dataset commit active
+```
+
+and the IPv6 interface should then be enabled:
+
+```text
+ifconfig up
+```
+
+before starting Thread.
+
+## Two-port development workflow
+
+The ESP32-H2-DevKit-N4 uses separate interfaces for flashing and the
+OpenThread CLI in this setup.
+
+### Flash interface
+
+```text
+/dev/cu.usbmodem11422401
+```
+
+```bash
+idf.py -p /dev/cu.usbmodem11422401 flash
+```
+
+### OpenThread CLI interface
+
+```text
+/dev/cu.usbmodem59710005001
+```
+
+```bash
+idf.py -p /dev/cu.usbmodem59710005001 monitor
+```
+
+Do **not** use:
+
+```bash
+idf.py -p /dev/cu.usbmodem11422401 flash monitor
+```
+
+because the OpenThread CLI is connected to the separate UART interface.
+
+## Subsequent boots
+
+Once an operational dataset has been stored, do not automatically run
+`dataset init new` on every boot.
+
+First check:
+
+```text
+state
+```
+
+and:
+
+```text
+dataset active -x
+```
+
+If the operational dataset is already present, use:
+
+```text
+ifconfig up
+thread start
+```
+
+Then:
+
+```text
+state
+```
+
+Creating a new dataset is only necessary when intentionally creating a
+new Thread network or replacing the existing network configuration.
+
+```
