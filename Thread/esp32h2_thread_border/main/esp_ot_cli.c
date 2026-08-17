@@ -42,8 +42,8 @@
  *
  * UART connection to ESP32-WROOM:
  *   UART:       UART1
- *   TX:         GPIO4
- *   RX:         GPIO5
+ *   TX:         GPIO24
+ *   RX:         GPIO23
  *   Baud rate:  115200
  *
  * UART message format:
@@ -137,8 +137,8 @@ static led_strip_handle_t led_strip;
 
 #define WROOM_UART_NUM          UART_NUM_1
 
-#define WROOM_UART_TX_GPIO     GPIO_NUM_4
-#define WROOM_UART_RX_GPIO     GPIO_NUM_5
+#define WROOM_UART_TX_GPIO     GPIO_NUM_24
+#define WROOM_UART_RX_GPIO     GPIO_NUM_23
 
 #define WROOM_UART_BAUD_RATE   115200
 
