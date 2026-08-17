@@ -135,7 +135,7 @@ idf.py -p <serial-port> monitor
 Example:
 
 ```bash
-idf.py -p /dev/cu.usbserial-110 monitor
+idf.py -p /dev/cu.usbmodem1142301 monitor
 ```
 
 After booting, the OpenThread CLI prompt appears:
