@@ -8,7 +8,7 @@
  *   over the Thread network to the Node 2 telemetry receiver.
  *
  * Thread communication:
- *   Transport:      IPv6 UDP
+ *   Transport:     IPv6 UDP
  *   Destination:   Node 2 / Thread Border Router
  *   UDP port:      55311
  *   Send interval: 10 seconds
@@ -42,8 +42,10 @@
  *   and RTC/time sources.
  */
 
+#include <time.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -110,9 +112,9 @@ static led_strip_handle_t led_strip;
 #define THREAD_TELEMETRY_PORT 55311
 #define TELEMETRY_INTERVAL_MS 10000
 #define THREAD_BORDER_ROUTER_IPV6 "fdde:ad00:beef:0:6156:1314:fcbf:27b6"
-#define DEVICE_ID "CBP-00400"       // Node 1
-//#define DEVICE_ID "CBP-00336"     // Node 2
-//#define DEVICE_ID "CBP-00212"     // Node 3
+//#define DEVICE_ID "CBP-00400"       // Node 1
+#define DEVICE_ID "CBP-00336"         // Node 2
+//#define DEVICE_ID "CBP-00212"       // Node 3
 
 #define TAG "ot_esp_cli"
 
@@ -134,6 +136,10 @@ static float getHumidity(void);
 static int getBatteryPercent(void);
 static const char *getTimestamp(void);
 static int buildTelemetryJSON(char *buffer, size_t buffer_size);
+
+//
+static void updateSimulatedSensors(void);
+static float random_float(float min, float max);
 
 static int hex_to_bytes(
     const char *hex,
@@ -289,6 +295,8 @@ static void led_green_blink(void)
 //
 static int buildTelemetryJSON(char *buffer, size_t buffer_size)
 {
+    updateSimulatedSensors();
+
     float actualCO = getActualCO();
     float predictedCO = getPredictedCO();
     float temperature = getTemperature();
@@ -326,34 +334,145 @@ static int buildTelemetryJSON(char *buffer, size_t buffer_size)
     return length;
 }
 
+// =========================================================
+// SIMULATED SENSOR DATA
+// =========================================================
+//
+// These values are simulated for demonstration purposes.
+// They change gradually so that the telemetry looks like
+// a real sensor rather than completely random data.
+//
+
+static float simulated_temperature = 21.4f;
+static float simulated_humidity = 48.2f;
+static float simulated_actual_co = 6.7f;
+static int simulated_battery = 87;
+
+static float random_float(float min, float max)
+{
+return min + ((float)rand() / (float)RAND_MAX) * (max - min);
+}
+
+static void updateSimulatedSensors(void)
+{
+// -----------------------------------------------------
+// Temperature
+// Normal indoor range: approximately 19 - 24 C
+// Small random movement each cycle
+// -----------------------------------------------------
+simulated_temperature += random_float(-0.4f, 0.4f);
+
+if (simulated_temperature < 19.0f)
+    simulated_temperature = 19.0f;
+
+if (simulated_temperature > 24.0f)
+    simulated_temperature = 24.0f;
+
+
+// -----------------------------------------------------
+// Humidity
+// Normal indoor range: approximately 40 - 60 %
+// -----------------------------------------------------
+simulated_humidity += random_float(-1.5f, 1.5f);
+
+if (simulated_humidity < 40.0f)
+    simulated_humidity = 40.0f;
+
+if (simulated_humidity > 60.0f)
+    simulated_humidity = 60.0f;
+
+
+// -----------------------------------------------------
+// Actual CO
+//
+// Typical demonstration range:
+// approximately 4 - 12 ppm
+//
+// The relatively small changes make it look like a
+// continuously monitored sensor.
+// -----------------------------------------------------
+simulated_actual_co += random_float(-1.0f, 1.0f);
+
+if (simulated_actual_co < 4.0f)
+    simulated_actual_co = 4.0f;
+
+if (simulated_actual_co > 12.0f)
+    simulated_actual_co = 12.0f;
+
+
+// -----------------------------------------------------
+// Battery
+//
+// Slowly decreases to demonstrate changing telemetry.
+// For a demo, reset to 100% after reaching 20%.
+// -----------------------------------------------------
+if ((rand() % 10) == 0) {
+    simulated_battery--;
+
+    if (simulated_battery < 20)
+        simulated_battery = 100;
+}
+}
+
+
 static float getActualCO(void)
 {
-    return 6.7f;
+    return simulated_actual_co;
 }
+
 
 static float getPredictedCO(void)
 {
-    return 8.2f;
+    // Simulate an AI/model prediction that is close to the
+    // measured CO value but not exactly identical.
+
+    float prediction =
+        simulated_actual_co + random_float(-0.8f, 0.8f);
+
+    if (prediction < 0.0f)
+        prediction = 0.0f;
+
+    return prediction;
 }
+
 
 static float getTemperature(void)
 {
-    return 21.4f;
+    return simulated_temperature;
 }
+
 
 static float getHumidity(void)
 {
-    return 48.2f;
+    return simulated_humidity;
 }
+
 
 static int getBatteryPercent(void)
 {
-    return 87;
+    return simulated_battery;
 }
+
 
 static const char *getTimestamp(void)
 {
-    return "2026-08-16T09:00:00Z";
+    static char timestamp[32];
+
+    time_t now;
+    struct tm timeinfo;
+
+    time(&now);
+
+    gmtime_r(&now, &timeinfo);
+
+    strftime(
+        timestamp,
+        sizeof(timestamp),
+        "%Y-%m-%dT%H:%M:%SZ",
+        &timeinfo
+    );
+
+    return timestamp;
 }
 
 static void sendTelemetry(void)
