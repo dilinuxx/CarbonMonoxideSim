@@ -1,0 +1,26 @@
+[1/9] Performing build step for 'bootloader'
+[1/1] cd /Users/admin/esp/esp32h2_thread_node/build/bootloader/esp-idf/esptool_py && /Users/admin/.espressif/python_env/idf5.2_py3.14_env/bin/python /Users/admin/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x0 /Users/admin/esp/esp32h2_thread_node/build/bootloader/bootloader.bin
+Bootloader binary size 0x5320 bytes. 0x2ce0 bytes (35%) free.
+[2/9] No install step for 'bootloader'
+[3/9] Completed 'bootloader'
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/esp_ot_cli.c.obj
+/Users/admin/esp/esp32h2_thread_node/main/esp_ot_cli.c:1001:14: warning: 'getHumidity_sim' defined but not used [-Wunused-function]
+ 1001 | static float getHumidity_sim(void)
+      |              ^~~~~~~~~~~~~~~
+/Users/admin/esp/esp32h2_thread_node/main/esp_ot_cli.c:995:14: warning: 'getTemperature_sim' defined but not used [-Wunused-function]
+  995 | static float getTemperature_sim(void)
+      |              ^~~~~~~~~~~~~~~~~~
+/Users/admin/esp/esp32h2_thread_node/main/esp_ot_cli.c:319:13: warning: 'led_off' defined but not used [-Wunused-function]
+  319 | static void led_off(void)
+      |             ^~~~~~~
+[5/9] Linking C static library esp-idf/main/libmain.a
+[6/9] Generating ld/sections.ld
+[7/9] Linking CXX executable esp_ot_cli.elf
+[8/9] Generating binary image from built executable
+esptool.py v4.11.0
+Creating esp32h2 image...
+Merged 2 ELF sections
+Successfully created esp32h2 image.
+Generated /Users/admin/esp/esp32h2_thread_node/build/esp_ot_cli.bin
+[9/9] cd /Users/admin/esp/esp32h2_thread_node/build/esp-idf/esptool_py && /Users/admin/.espressif/python_env/idf5.2_py3.14_env/bin/python /Users/admin/esp/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app /Users/admin/esp/esp32h2_thread_node/build/partition_table/partition-table.bin /Users/admin/esp/esp32h2_thread_node/build/esp_ot_cli.bin
+esp_ot_cli.bin binary size 0xfaec0 bytes. Smallest app partition is 0x120000 bytes. 0x25140 bytes (13%) free.
