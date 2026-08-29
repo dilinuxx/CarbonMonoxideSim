@@ -10,36 +10,20 @@
  * Thread communication:
  *   Transport:     IPv6 UDP
  *   Destination:   Node 2 / Thread Border Router
- *   UDP port:      55311
- *   Send interval: 10 seconds
  *
- * Destination:
- *   fdde:ad00:beef:0:6156:1314:fcbf:27b6
- *
- * Telemetry payload:
- *   JSON containing:
- *     - device_id
- *     - timestamp
- *     - sensor_status
- *     - alarm
- *     - predicted_co_ppm
- *     - actual_co_ppm
- *     - temperature
- *     - humidity
- *     - battery_percent
+ * Power optimisation:
+ *   - Configurable telemetry interval
+ *   - BME280 operates in forced mode
+ *   - LED only flashes briefly when required
+ *   - Designed as the next stage toward battery operation
  *
  * LED status:
- *   RED   = Thread device is not attached
- *   BLUE  = Thread attached / ready
- *   GREEN = Telemetry successfully transmitted
+ *   RED   = 1 second during boot
+ *   GREEN = 1 second when Thread first attaches
+ *   BLUE  = 1 second after successful telemetry transmission
  *
  * Current device:
  *   CBP-00336
- *
- * Note:
- *   Sensor values and timestamp are currently simulated by the
- *   get*() functions and can later be replaced by real sensor
- *   and RTC/time sources.
  */
 
 #include <time.h>
@@ -82,31 +66,39 @@
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 #include "esp_ot_cli_extension.h"
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
+#endif
+
 
 // =========================================================
 // GATEWAY THREAD ACTIVE DATASET
 // =========================================================
-//
-// This is the Active Operational Dataset copied from the
-// Thread gateway.
-//
-//
+
 static const char *THREAD_GATEWAY_DATASET_HEX =
     "0e080000000000000000000300000b35060004001fffe00208"
     "dead00beef00cafe0708fddead00beef00000510b010b6cc59a"
     "946a51b7d8ad6bcc061b7030a4f70656e546872656164010257"
     "e20410e363929d52764efa12fbb8760b498e890c0402a0f7f8";
 
+
 // =========================================================
 // LED CONFIGURATION
 // =========================================================
+
 #define LED_GPIO GPIO_NUM_8
 #define LED_COUNT 1
+
+/*
+ * Keep LED brightness low to reduce battery consumption.
+ */
 #define LED_BRIGHTNESS 32
-#define LED_GREEN_BLINK_MS 200
+
+/*
+ * Requested LED flash duration.
+ */
+#define LED_FLASH_MS 1000
 
 static led_strip_handle_t led_strip;
+
 
 // =========================================================
 // BME280 REGISTERS
@@ -125,6 +117,7 @@ static led_strip_handle_t led_strip;
 #define BME280_REG_CALIB_26  0xE1
 
 #define BME280_CHIP_ID       0x60
+
 
 // =========================================================
 // BME280 CALIBRATION DATA
@@ -153,6 +146,7 @@ static int8_t   dig_H6;
 
 static int32_t t_fine;
 
+
 // =========================================================
 // BME280 / I2C CONFIGURATION
 // =========================================================
@@ -161,76 +155,111 @@ static float real_temperature = 0.0f;
 static float real_humidity = 0.0f;
 static float real_pressure = 0.0f;
 
-/*
- * ESP-IDF i2c_simple example for targets other than
- * ESP32 / ESP32-S2 / ESP32-S3 defaults to:
- *
- *   SDA = GPIO 1
- *   SCL = GPIO 2
- *
- * We therefore use the same GPIO assignment here.
- */
-
 #define I2C_MASTER_SDA_IO       GPIO_NUM_1
 #define I2C_MASTER_SCL_IO       GPIO_NUM_2
 #define I2C_MASTER_NUM          I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ      100000
 #define I2C_MASTER_TIMEOUT_MS   1000
 
-/*
- * BME280 modules commonly use either:
- *
- *   0x76
- *   0x77
- *
- * We start with 0x77.
- */
 #define BME280_I2C_ADDRESS      0x77
 
 static i2c_master_bus_handle_t bme280_i2c_bus = NULL;
 static i2c_master_dev_handle_t bme280_i2c_dev = NULL;
 
 static esp_err_t bme280_init(void);
-static esp_err_t bme280_read(float *temperature, float *humidity, float *pressure);
+static esp_err_t bme280_read(float *temperature,
+                             float *humidity,
+                             float *pressure);
+
 static void updateBME280(void);
 static void i2c_scan(void);
+
 static esp_err_t bme280_i2c_bus_init(void);
 static esp_err_t bme280_i2c_device_init(void);
+
 
 // =========================================================
 // THREAD TELEMETRY CONFIGURATION
 // =========================================================
+
 #define THREAD_TELEMETRY_PORT 55311
-#define TELEMETRY_INTERVAL_MS 10000
-#define THREAD_BORDER_ROUTER_IPV6 "fdde:ad00:beef:0:6156:1314:fcbf:27b6"
-//#define DEVICE_ID "CBP-00400"       // Node 1
-#define DEVICE_ID "CBP-00336"         // Node 2
-//#define DEVICE_ID "CBP-00212"       // Node 3
+
+/*
+ * =====================================================
+ * TELEMETRY INTERVAL
+ * =====================================================
+ *
+ * Change ONLY this value to change transmission rate.
+ *
+ * 10 seconds:
+ *   10 * 1000
+ *
+ * 5 minutes:
+ *   5 * 60 * 1000
+ *
+ * 10 minutes:
+ *   10 * 60 * 1000
+ *
+ * Current battery-optimised setting:
+ *   5 minutes
+ */
+#define TELEMETRY_INTERVAL_MS (5 * 60 * 1000)
+
+#define THREAD_BORDER_ROUTER_IPV6 \
+    "fdde:ad00:beef:0:6156:1314:fcbf:27b6"
+
+#define DEVICE_ID "CBP-00336"
 
 #define TAG "ot_esp_cli"
 
-//
-static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_size);
+// =========================================================
+// FUNCTION DECLARATIONS
+// =========================================================
 
-//
+static int hex_to_bytes(const char *hex,
+                        uint8_t *out,
+                        size_t out_size);
+
+static int load_gateway_dataset(
+    otOperationalDatasetTlvs *dataset);
+
+
+// LED
+
 static void led_init(void);
 static void led_off(void);
 static void led_red(void);
+static void led_green(void);
 static void led_blue(void);
-static void led_green_blink(void);
 
-//
+static void led_red_flash(void);
+static void led_green_flash(void);
+static void led_blue_flash(void);
+
+
+// Sensor / telemetry
+
 static float getActualCO(void);
 static float getPredictedCO(void);
 static float getTemperature(void);
 static float getHumidity(void);
 static int getBatteryPercent(void);
 static const char *getTimestamp(void);
-static void updateSimulatedSensors(void);
-static int buildTelemetryJSON(char *buffer, size_t buffer_size);
 
-//
-static float random_float(float min, float max);
+static void updateSimulatedSensors(void);
+
+static int buildTelemetryJSON(char *buffer,
+                              size_t buffer_size);
+
+static float random_float(float min,
+                          float max);
+
+static void sendTelemetry(void);
+
+
+// =========================================================
+// DATASET HEX CONVERSION
+// =========================================================
 
 static int hex_to_bytes(
     const char *hex,
@@ -240,19 +269,26 @@ static int hex_to_bytes(
     size_t hex_len = strlen(hex);
 
     if ((hex_len % 2) != 0) {
-        ESP_LOGE(TAG, "Dataset hex string has odd length");
+
+        ESP_LOGE(
+            TAG,
+            "Dataset hex string has odd length"
+        );
+
         return -1;
     }
 
     size_t byte_len = hex_len / 2;
 
     if (byte_len > out_size) {
+
         ESP_LOGE(
             TAG,
             "Dataset too large: %u bytes, max %u",
             (unsigned)byte_len,
             (unsigned)out_size
         );
+
         return -1;
     }
 
@@ -260,12 +296,18 @@ static int hex_to_bytes(
 
         unsigned int value;
 
-        if (sscanf(&hex[i * 2], "%2x", &value) != 1) {
+        if (sscanf(
+                &hex[i * 2],
+                "%2x",
+                &value
+            ) != 1) {
+
             ESP_LOGE(
                 TAG,
                 "Invalid dataset hex at position %u",
                 (unsigned)(i * 2)
             );
+
             return -1;
         }
 
@@ -275,9 +317,19 @@ static int hex_to_bytes(
     return (int)byte_len;
 }
 
-static int load_gateway_dataset(otOperationalDatasetTlvs *dataset)
+
+// =========================================================
+// LOAD THREAD DATASET
+// =========================================================
+
+static int load_gateway_dataset(
+    otOperationalDatasetTlvs *dataset)
 {
-    memset(dataset, 0, sizeof(*dataset));
+    memset(
+        dataset,
+        0,
+        sizeof(*dataset)
+    );
 
     int length = hex_to_bytes(
         THREAD_GATEWAY_DATASET_HEX,
@@ -299,6 +351,11 @@ static int load_gateway_dataset(otOperationalDatasetTlvs *dataset)
 
     return 0;
 }
+
+
+// =========================================================
+// LED INITIALISATION
+// =========================================================
 
 static void led_init(void)
 {
@@ -322,15 +379,35 @@ static void led_init(void)
         )
     );
 
-    ESP_ERROR_CHECK(led_strip_clear(led_strip));
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    ESP_ERROR_CHECK(
+        led_strip_clear(led_strip)
+    );
+
+    ESP_ERROR_CHECK(
+        led_strip_refresh(led_strip)
+    );
 }
+
+
+// =========================================================
+// LED OFF
+// =========================================================
 
 static void led_off(void)
 {
-    ESP_ERROR_CHECK(led_strip_clear(led_strip));
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    ESP_ERROR_CHECK(
+        led_strip_clear(led_strip)
+    );
+
+    ESP_ERROR_CHECK(
+        led_strip_refresh(led_strip)
+    );
 }
+
+
+// =========================================================
+// RED LED
+// =========================================================
 
 static void led_red(void)
 {
@@ -344,8 +421,37 @@ static void led_red(void)
         )
     );
 
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    ESP_ERROR_CHECK(
+        led_strip_refresh(led_strip)
+    );
 }
+
+
+// =========================================================
+// GREEN LED
+// =========================================================
+
+static void led_green(void)
+{
+    ESP_ERROR_CHECK(
+        led_strip_set_pixel(
+            led_strip,
+            0,
+            0,
+            LED_BRIGHTNESS,
+            0
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        led_strip_refresh(led_strip)
+    );
+}
+
+
+// =========================================================
+// BLUE LED
+// =========================================================
 
 static void led_blue(void)
 {
@@ -359,55 +465,100 @@ static void led_blue(void)
         )
     );
 
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    ESP_ERROR_CHECK(
+        led_strip_refresh(led_strip)
+    );
 }
 
-static void led_green_blink(void)
+
+// =========================================================
+// RED BOOT FLASH
+// =========================================================
+
+static void led_red_flash(void)
 {
-    ESP_ERROR_CHECK(
-        led_strip_set_pixel(
-            led_strip,
-            0,
-            0,
-            LED_BRIGHTNESS,
-            0
-        )
+    led_red();
+
+    vTaskDelay(
+        pdMS_TO_TICKS(LED_FLASH_MS)
     );
 
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-
-    vTaskDelay(pdMS_TO_TICKS(LED_GREEN_BLINK_MS));
-
-    led_blue();
-
-    //led_off();
+    led_off();
 }
 
-//
+
+// =========================================================
+// GREEN THREAD ATTACHED FLASH
+// =========================================================
+
+static void led_green_flash(void)
+{
+    led_green();
+
+    vTaskDelay(
+        pdMS_TO_TICKS(LED_FLASH_MS)
+    );
+
+    led_off();
+}
+
+
+// =========================================================
+// BLUE TELEMETRY FLASH
+// =========================================================
+
+static void led_blue_flash(void)
+{
+    led_blue();
+
+    vTaskDelay(
+        pdMS_TO_TICKS(LED_FLASH_MS)
+    );
+
+    led_off();
+}
+
+
+// =========================================================
+// I2C BUS INITIALISATION
+// =========================================================
+
 static esp_err_t bme280_i2c_bus_init(void)
 {
-    ESP_LOGI(TAG, "Initializing I2C bus...");
+    ESP_LOGI(
+        TAG,
+        "Initializing I2C bus..."
+    );
 
     i2c_master_bus_config_t bus_config = {
+
         .i2c_port = I2C_MASTER_NUM,
+
         .sda_io_num = I2C_MASTER_SDA_IO,
+
         .scl_io_num = I2C_MASTER_SCL_IO,
+
         .clk_source = I2C_CLK_SRC_DEFAULT,
+
         .glitch_ignore_cnt = 7,
+
         .flags.enable_internal_pullup = true,
     };
 
-    esp_err_t err = i2c_new_master_bus(
-        &bus_config,
-        &bme280_i2c_bus
-    );
+    esp_err_t err =
+        i2c_new_master_bus(
+            &bus_config,
+            &bme280_i2c_bus
+        );
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
             "Failed to initialize I2C bus: %s",
             esp_err_to_name(err)
         );
+
         return err;
     }
 
@@ -421,25 +572,42 @@ static esp_err_t bme280_i2c_bus_init(void)
     return ESP_OK;
 }
 
-//
+
+// =========================================================
+// I2C SCAN
+// =========================================================
+
 static void i2c_scan(void)
 {
-    ESP_LOGI(TAG, "Scanning I2C bus...");
+    ESP_LOGI(
+        TAG,
+        "Scanning I2C bus..."
+    );
 
     if (bme280_i2c_bus == NULL) {
-        ESP_LOGE(TAG, "I2C scan aborted: bus handle is NULL");
+
+        ESP_LOGE(
+            TAG,
+            "I2C scan aborted: bus handle is NULL"
+        );
+
         return;
     }
 
     int found = 0;
 
-    for (uint8_t address = 1; address < 127; address++) {
+    for (
+        uint8_t address = 1;
+        address < 127;
+        address++
+    ) {
 
-        esp_err_t err = i2c_master_probe(
-            bme280_i2c_bus,
-            address,
-            I2C_MASTER_TIMEOUT_MS
-        );
+        esp_err_t err =
+            i2c_master_probe(
+                bme280_i2c_bus,
+                address,
+                I2C_MASTER_TIMEOUT_MS
+            );
 
         if (err == ESP_OK) {
 
@@ -454,6 +622,7 @@ static void i2c_scan(void)
     }
 
     if (found == 0) {
+
         ESP_LOGW(
             TAG,
             "No I2C devices found"
@@ -467,32 +636,47 @@ static void i2c_scan(void)
     );
 }
 
-//
+
+// =========================================================
+// BME280 DEVICE INITIALISATION
+// =========================================================
+
 static esp_err_t bme280_i2c_device_init(void)
 {
     if (bme280_i2c_bus == NULL) {
-        ESP_LOGE(TAG, "Cannot add BME280: I2C bus is not initialized");
+
+        ESP_LOGE(
+            TAG,
+            "Cannot add BME280: I2C bus is not initialized"
+        );
+
         return ESP_ERR_INVALID_STATE;
     }
 
     i2c_device_config_t device_config = {
+
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+
         .device_address = BME280_I2C_ADDRESS,
+
         .scl_speed_hz = I2C_MASTER_FREQ_HZ,
     };
 
-    esp_err_t err = i2c_master_bus_add_device(
-        bme280_i2c_bus,
-        &device_config,
-        &bme280_i2c_dev
-    );
+    esp_err_t err =
+        i2c_master_bus_add_device(
+            bme280_i2c_bus,
+            &device_config,
+            &bme280_i2c_dev
+        );
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
             "BME280 device init failed: %s",
             esp_err_to_name(err)
         );
+
         return err;
     }
 
@@ -505,14 +689,23 @@ static esp_err_t bme280_i2c_device_init(void)
     return ESP_OK;
 }
 
-//
+
+// =========================================================
+// BME280 REGISTER READ
+// =========================================================
+
 static esp_err_t bme280_read_register(
     uint8_t reg,
     uint8_t *data,
     size_t length)
 {
     if (bme280_i2c_dev == NULL) {
-        ESP_LOGE(TAG, "BME280 read failed: device handle is NULL");
+
+        ESP_LOGE(
+            TAG,
+            "BME280 read failed: device handle is NULL"
+        );
+
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -526,13 +719,22 @@ static esp_err_t bme280_read_register(
     );
 }
 
-//
+
+// =========================================================
+// BME280 REGISTER WRITE
+// =========================================================
+
 static esp_err_t bme280_write_register(
     uint8_t reg,
     uint8_t value)
 {
     if (bme280_i2c_dev == NULL) {
-        ESP_LOGE(TAG, "BME280 write failed: device handle is NULL");
+
+        ESP_LOGE(
+            TAG,
+            "BME280 write failed: device handle is NULL"
+        );
+
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -548,6 +750,11 @@ static esp_err_t bme280_write_register(
         I2C_MASTER_TIMEOUT_MS
     );
 }
+
+
+// =========================================================
+// BME280 CALIBRATION
+// =========================================================
 
 static esp_err_t bme280_read_calibration(void)
 {
@@ -576,73 +783,152 @@ static esp_err_t bme280_read_calibration(void)
         return err;
     }
 
-    // -----------------------------------------------------
+
     // Temperature calibration
-    // -----------------------------------------------------
 
-    dig_T1 = (uint16_t)(calib1[1] << 8 | calib1[0]);
-    dig_T2 = (int16_t)(calib1[3] << 8 | calib1[2]);
-    dig_T3 = (int16_t)(calib1[5] << 8 | calib1[4]);
+    dig_T1 =
+        (uint16_t)(
+            calib1[1] << 8 |
+            calib1[0]
+        );
 
-    // -----------------------------------------------------
+    dig_T2 =
+        (int16_t)(
+            calib1[3] << 8 |
+            calib1[2]
+        );
+
+    dig_T3 =
+        (int16_t)(
+            calib1[5] << 8 |
+            calib1[4]
+        );
+
+
     // Pressure calibration
-    // -----------------------------------------------------
 
-    dig_P1 = (uint16_t)(calib1[7] << 8 | calib1[6]);
-    dig_P2 = (int16_t)(calib1[9] << 8 | calib1[8]);
-    dig_P3 = (int16_t)(calib1[11] << 8 | calib1[10]);
-    dig_P4 = (int16_t)(calib1[13] << 8 | calib1[12]);
-    dig_P5 = (int16_t)(calib1[15] << 8 | calib1[14]);
-    dig_P6 = (int16_t)(calib1[17] << 8 | calib1[16]);
-    dig_P7 = (int16_t)(calib1[19] << 8 | calib1[18]);
-    dig_P8 = (int16_t)(calib1[21] << 8 | calib1[20]);
-    dig_P9 = (int16_t)(calib1[23] << 8 | calib1[22]);
+    dig_P1 =
+        (uint16_t)(
+            calib1[7] << 8 |
+            calib1[6]
+        );
 
-    // -----------------------------------------------------
+    dig_P2 =
+        (int16_t)(
+            calib1[9] << 8 |
+            calib1[8]
+        );
+
+    dig_P3 =
+        (int16_t)(
+            calib1[11] << 8 |
+            calib1[10]
+        );
+
+    dig_P4 =
+        (int16_t)(
+            calib1[13] << 8 |
+            calib1[12]
+        );
+
+    dig_P5 =
+        (int16_t)(
+            calib1[15] << 8 |
+            calib1[14]
+        );
+
+    dig_P6 =
+        (int16_t)(
+            calib1[17] << 8 |
+            calib1[16]
+        );
+
+    dig_P7 =
+        (int16_t)(
+            calib1[19] << 8 |
+            calib1[18]
+        );
+
+    dig_P8 =
+        (int16_t)(
+            calib1[21] << 8 |
+            calib1[20]
+        );
+
+    dig_P9 =
+        (int16_t)(
+            calib1[23] << 8 |
+            calib1[22]
+        );
+
+
     // Humidity calibration
-    // -----------------------------------------------------
 
     dig_H1 = calib1[25];
 
-    dig_H2 = (int16_t)(calib2[1] << 8 | calib2[0]);
+    dig_H2 =
+        (int16_t)(
+            calib2[1] << 8 |
+            calib2[0]
+        );
+
     dig_H3 = calib2[2];
 
-    dig_H4 = (int16_t)((calib2[3] << 4) |
-                       (calib2[4] & 0x0F));
+    dig_H4 =
+        (int16_t)(
+            (calib2[3] << 4) |
+            (calib2[4] & 0x0F)
+        );
 
-    dig_H5 = (int16_t)((calib2[5] << 4) |
-                       (calib2[4] >> 4));
+    dig_H5 =
+        (int16_t)(
+            (calib2[5] << 4) |
+            (calib2[4] >> 4)
+        );
 
-    dig_H6 = (int8_t)calib2[6];
+    dig_H6 =
+        (int8_t)calib2[6];
 
-    ESP_LOGI(TAG, "BME280 calibration data loaded");
+    ESP_LOGI(
+        TAG,
+        "BME280 calibration data loaded"
+    );
 
     return ESP_OK;
 }
 
+
+// =========================================================
+// BME280 INITIALISATION
+// =========================================================
+
 static esp_err_t bme280_init(void)
 {
-    ESP_LOGI(TAG, "Initializing BME280 I2C...");
-
-    /*
-     * The I2C bus has already been created and scanned
-     * by bme280_i2c_bus_init().
-     *
-     * We must NOT create another I2C bus here.
-     */
+    ESP_LOGI(
+        TAG,
+        "Initializing BME280 I2C..."
+    );
 
     if (bme280_i2c_bus == NULL) {
-        ESP_LOGE(TAG, "BME280 initialization failed: I2C bus is NULL");
+
+        ESP_LOGE(
+            TAG,
+            "BME280 initialization failed: I2C bus is NULL"
+        );
+
         return ESP_ERR_INVALID_STATE;
     }
 
     if (bme280_i2c_dev == NULL) {
-        esp_err_t err = bme280_i2c_device_init();
+
+        esp_err_t err =
+            bme280_i2c_device_init();
 
         if (err != ESP_OK) {
             return err;
         }
     }
+
 
     // -----------------------------------------------------
     // Check chip ID
@@ -650,18 +936,21 @@ static esp_err_t bme280_init(void)
 
     uint8_t chip_id = 0;
 
-    esp_err_t err = bme280_read_register(
-        BME280_REG_ID,
-        &chip_id,
-        1
-    );
+    esp_err_t err =
+        bme280_read_register(
+            BME280_REG_ID,
+            &chip_id,
+            1
+        );
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
             "Failed to read BME280 chip ID: %s",
             esp_err_to_name(err)
         );
+
         return err;
     }
 
@@ -672,12 +961,15 @@ static esp_err_t bme280_init(void)
     );
 
     if (chip_id != BME280_CHIP_ID) {
+
         ESP_LOGE(
             TAG,
             "Unexpected BME280 chip ID! Expected 0x60"
         );
+
         return ESP_ERR_NOT_FOUND;
     }
+
 
     // -----------------------------------------------------
     // Read calibration
@@ -686,12 +978,15 @@ static esp_err_t bme280_init(void)
     err = bme280_read_calibration();
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
             "Failed to read BME280 calibration"
         );
+
         return err;
     }
+
 
     // -----------------------------------------------------
     // Configure humidity
@@ -699,51 +994,79 @@ static esp_err_t bme280_init(void)
     // osrs_h = 1
     // -----------------------------------------------------
 
-    err = bme280_write_register(
-        BME280_REG_CTRL_HUM,
-        0x01
-    );
+    err =
+        bme280_write_register(
+            BME280_REG_CTRL_HUM,
+            0x01
+        );
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
             "Failed to configure BME280 humidity: %s",
             esp_err_to_name(err)
         );
+
         return err;
     }
+
 
     // -----------------------------------------------------
     // Configure measurement
     //
     // osrs_t = 1
     // osrs_p = 1
-    // mode   = normal
+    // mode   = FORCED
     //
-    // 001 001 11
-    // 0x27
+    // 001 001 01
+    //
+    // 0x25
+    //
+    // IMPORTANT:
+    //
+    // Previous code used:
+    //
+    //     0x27 = NORMAL MODE
+    //
+    // This revision uses:
+    //
+    //     0x25 = FORCED MODE
+    //
+    // The sensor performs a measurement only when
+    // requested by the application.
     // -----------------------------------------------------
 
-    err = bme280_write_register(
-        BME280_REG_CTRL_MEAS,
-        0x27
-    );
+    err =
+        bme280_write_register(
+            BME280_REG_CTRL_MEAS,
+            0x25
+        );
 
     if (err != ESP_OK) {
+
         ESP_LOGE(
             TAG,
-            "Failed to configure BME280 measurement: %s",
+            "Failed to configure BME280 forced mode: %s",
             esp_err_to_name(err)
         );
+
         return err;
     }
 
-    ESP_LOGI(TAG, "BME280 initialized successfully");
+    ESP_LOGI(
+        TAG,
+        "BME280 initialized successfully (forced mode)"
+    );
 
     return ESP_OK;
 }
 
-//
+
+// =========================================================
+// BME280 TEMPERATURE COMPENSATION
+// =========================================================
+
 static float bme280_compensate_temperature(
     int32_t adc_T)
 {
@@ -763,14 +1086,20 @@ static float bme280_compensate_temperature(
            ((int32_t)dig_T1)) >> 12) *
          ((int32_t)dig_T3)) >> 14;
 
-    t_fine = var1 + var2;
+    t_fine =
+        var1 + var2;
 
-    T = (t_fine * 5 + 128) >> 8;
+    T =
+        (t_fine * 5 + 128) >> 8;
 
     return T / 100.0f;
 }
 
-//
+
+// =========================================================
+// BME280 PRESSURE COMPENSATION
+// =========================================================
+
 static float bme280_compensate_pressure(
     int32_t adc_P)
 {
@@ -778,29 +1107,42 @@ static float bme280_compensate_pressure(
     int64_t var2;
     int64_t p;
 
-    var1 = ((int64_t)t_fine) - 128000;
+    var1 =
+        ((int64_t)t_fine) - 128000;
 
-    var2 = var1 * var1 * (int64_t)dig_P6;
-    var2 = var2 +
-           ((var1 * (int64_t)dig_P5) << 17);
-    var2 = var2 +
-           (((int64_t)dig_P4) << 35);
+    var2 =
+        var1 * var1 *
+        (int64_t)dig_P6;
+
+    var2 =
+        var2 +
+        ((var1 * (int64_t)dig_P5) << 17);
+
+    var2 =
+        var2 +
+        (((int64_t)dig_P4) << 35);
 
     var1 =
-        ((var1 * var1 * (int64_t)dig_P3) >> 8) +
+        ((var1 * var1 *
+          (int64_t)dig_P3) >> 8) +
         ((var1 * (int64_t)dig_P2) << 12);
 
     var1 =
-        (((((int64_t)1) << 47) + var1) *
+        (((((int64_t)1) << 47) +
+          var1) *
          ((int64_t)dig_P1)) >> 33;
 
     if (var1 == 0) {
         return 0.0f;
     }
 
-    p = 1048576 - adc_P;
+    p =
+        1048576 - adc_P;
 
-    p = (((p << 31) - var2) * 3125) / var1;
+    p =
+        (((p << 31) - var2) *
+         3125) /
+        var1;
 
     var1 =
         ((int64_t)dig_P9 *
@@ -817,27 +1159,33 @@ static float bme280_compensate_pressure(
     return (float)p / 25600.0f;
 }
 
-//
+
+// =========================================================
+// BME280 HUMIDITY COMPENSATION
+// =========================================================
+
 static float bme280_compensate_humidity(
     int32_t adc_H)
 {
     int32_t v_x1_u32r;
 
     v_x1_u32r =
-        t_fine - ((int32_t)76800);
+        t_fine - 76800;
 
     v_x1_u32r =
         (((((adc_H << 14) -
             (((int32_t)dig_H4) << 20) -
-            (((int32_t)dig_H5) * v_x1_u32r)) +
-           ((int32_t)16384)) >> 15) *
+            (((int32_t)dig_H5) *
+             v_x1_u32r)) +
+           16384) >> 15) *
          (((((((v_x1_u32r *
-               ((int32_t)dig_H6)) >> 10) *
-              (((v_x1_u32r *
-                 ((int32_t)dig_H3)) >> 11) +
-               ((int32_t)32768))) >> 10) +
-            ((int32_t)2097152)) *
-          ((int32_t)dig_H2) + 8192) >> 14));
+                ((int32_t)dig_H6)) >> 10) *
+               (((v_x1_u32r *
+                  ((int32_t)dig_H3)) >> 11) +
+                32768)) >> 10) +
+            2097152) *
+           ((int32_t)dig_H2) +
+          8192) >> 14));
 
     v_x1_u32r =
         v_x1_u32r -
@@ -851,10 +1199,29 @@ static float bme280_compensate_humidity(
     if (v_x1_u32r > 419430400)
         v_x1_u32r = 419430400;
 
-    return (v_x1_u32r >> 12) / 1024.0f;
+    return
+        (v_x1_u32r >> 12) /
+        1024.0f;
 }
 
+
+// =========================================================
+// BME280 READ
+// =========================================================
 //
+// IMPORTANT POWER OPTIMISATION:
+//
+// Every time this function is called:
+//
+// 1. BME280 is commanded into forced mode.
+// 2. It performs ONE measurement.
+// 3. Data is read.
+// 4. The BME280 automatically returns to sleep.
+//
+// Therefore the BME280 is not continuously measuring
+// during the 5-minute wait.
+//
+
 static esp_err_t bme280_read(
     float *temperature,
     float *humidity,
@@ -862,15 +1229,65 @@ static esp_err_t bme280_read(
 {
     uint8_t data[8];
 
-    esp_err_t err = bme280_read_register(
-        BME280_REG_DATA,
-        data,
-        sizeof(data)
+    // -----------------------------------------------------
+    // Start one forced measurement
+    //
+    // osrs_t = 1
+    // osrs_p = 1
+    // mode   = forced
+    //
+    // 0x25
+    // -----------------------------------------------------
+
+    esp_err_t err =
+        bme280_write_register(
+            BME280_REG_CTRL_MEAS,
+            0x25
+        );
+
+    if (err != ESP_OK) {
+
+        ESP_LOGE(
+            TAG,
+            "Failed to start BME280 measurement: %s",
+            esp_err_to_name(err)
+        );
+
+        return err;
+    }
+
+
+    // -----------------------------------------------------
+    // Wait for measurement to complete
+    //
+    // Oversampling:
+    //   Temperature x1
+    //   Pressure    x1
+    //   Humidity    x1
+    //
+    // 10 ms provides sufficient margin.
+    // -----------------------------------------------------
+
+    vTaskDelay(
+        pdMS_TO_TICKS(10)
     );
+
+
+    // -----------------------------------------------------
+    // Read sensor data
+    // -----------------------------------------------------
+
+    err =
+        bme280_read_register(
+            BME280_REG_DATA,
+            data,
+            sizeof(data)
+        );
 
     if (err != ESP_OK) {
         return err;
     }
+
 
     // -----------------------------------------------------
     // Raw temperature
@@ -881,6 +1298,7 @@ static esp_err_t bme280_read(
         ((int32_t)data[4] << 4) |
         ((int32_t)data[5] >> 4);
 
+
     // -----------------------------------------------------
     // Raw pressure
     // -----------------------------------------------------
@@ -890,6 +1308,7 @@ static esp_err_t bme280_read(
         ((int32_t)data[1] << 4) |
         ((int32_t)data[2] >> 4);
 
+
     // -----------------------------------------------------
     // Raw humidity
     // -----------------------------------------------------
@@ -898,8 +1317,9 @@ static esp_err_t bme280_read(
         ((int32_t)data[6] << 8) |
         data[7];
 
+
     // -----------------------------------------------------
-    // Compensated temperature
+    // Compensated values
     // -----------------------------------------------------
 
     *temperature =
@@ -907,18 +1327,10 @@ static esp_err_t bme280_read(
             adc_temperature
         );
 
-    // -----------------------------------------------------
-    // Compensated pressure
-    // -----------------------------------------------------
-
     *pressure =
         bme280_compensate_pressure(
             adc_pressure
         );
-
-    // -----------------------------------------------------
-    // Compensated humidity
-    // -----------------------------------------------------
 
     *humidity =
         bme280_compensate_humidity(
@@ -928,128 +1340,107 @@ static esp_err_t bme280_read(
     return ESP_OK;
 }
 
-//
-static int buildTelemetryJSON(char *buffer, size_t buffer_size)
-{
-    updateBME280();
-
-    updateSimulatedSensors();
-
-    float actualCO = getActualCO();
-    float predictedCO = getPredictedCO();
-    float temperature = getTemperature();
-    float humidity = getHumidity();
-    float pressure = real_pressure;
-    int battery = getBatteryPercent();
-
-    int length = snprintf(
-        buffer,
-        buffer_size,
-        "{"
-        "\"device_id\":\"%s\","
-        "\"timestamp\":\"%s\","
-        "\"sensor_status\":\"online\","
-        "\"alarm\":false,"
-        "\"predicted_co_ppm\":%.1f,"
-        "\"actual_co_ppm\":%.1f,"
-        "\"temperature\":%.1f,"
-        "\"humidity\":%.1f,"
-        "\"pressure\":%.2f,"
-        "\"battery_percent\":%d"
-        "}",
-        DEVICE_ID,
-        getTimestamp(),
-        predictedCO,
-        actualCO,
-        temperature,
-        humidity,
-        pressure,
-        battery
-    );
-
-    if (length < 0 || (size_t)length >= buffer_size) {
-        ESP_LOGE(TAG, "Telemetry JSON buffer too small");
-        return -1;
-    }
-
-    return length;
-}
 
 // =========================================================
-// SIMULATED SENSOR DATA
+// UPDATE BME280
 // =========================================================
-//
-// These values are simulated for demonstration purposes.
-// They change gradually so that the telemetry looks like
-// a real sensor rather than completely random data.
-//
-
-static float simulated_actual_co = 6.7f;
-static int simulated_battery = 87;
-
-static float random_float(float min, float max)
-{
-    return min + ((float)rand() / (float)RAND_MAX) * (max - min);
-}
-
-static void updateSimulatedSensors(void)
-{  
-// -----------------------------------------------------
-// Actual CO
-//
-// Typical demonstration range:
-// approximately 4 - 12 ppm
-//
-// The relatively small changes make it look like a
-// continuously monitored sensor.
-// -----------------------------------------------------
-simulated_actual_co += random_float(-1.0f, 1.0f);
-
-if (simulated_actual_co < 4.0f)
-    simulated_actual_co = 4.0f;
-
-if (simulated_actual_co > 12.0f)
-    simulated_actual_co = 12.0f;
-
-
-// -----------------------------------------------------
-// Battery
-//
-// Slowly decreases to demonstrate changing telemetry.
-// For a demo, reset to 100% after reaching 20%.
-// -----------------------------------------------------
-if ((rand() % 10) == 0) {
-    simulated_battery--;
-
-    if (simulated_battery < 20)
-        simulated_battery = 100;
-}
-}
 
 static void updateBME280(void)
 {
-    esp_err_t err = bme280_read(
-        &real_temperature,
-        &real_humidity,
-        &real_pressure
-    );
+    esp_err_t err =
+        bme280_read(
+            &real_temperature,
+            &real_humidity,
+            &real_pressure
+        );
 
     if (err != ESP_OK) {
 
-        ESP_LOGE(TAG,
-                 "Failed to read BME280: %s",
-                 esp_err_to_name(err));
+        ESP_LOGE(
+            TAG,
+            "Failed to read BME280: %s",
+            esp_err_to_name(err)
+        );
 
         return;
     }
 
-    ESP_LOGI(TAG,
-             "BME280: Temperature=%.2f C, Humidity=%.2f %%, Pressure=%.2f hPa",
-             real_temperature,
-             real_humidity,
-             real_pressure);
+    ESP_LOGI(
+        TAG,
+        "BME280: Temperature=%.2f C, Humidity=%.2f %%, Pressure=%.2f hPa",
+        real_temperature,
+        real_humidity,
+        real_pressure
+    );
 }
 
+
+// =========================================================
+// SIMULATED SENSOR DATA
+// =========================================================
+
+static float simulated_actual_co = 6.7f;
+
+static int simulated_battery = 87;
+
+
+// =========================================================
+// RANDOM FLOAT
+// =========================================================
+
+static float random_float(
+    float min,
+    float max)
+{
+    return
+        min +
+        ((float)rand() /
+         (float)RAND_MAX) *
+        (max - min);
+}
+
+
+// =========================================================
+// UPDATE SIMULATED SENSORS
+// =========================================================
+
+static void updateSimulatedSensors(void)
+{
+    // -----------------------------------------------------
+    // Actual CO
+    // -----------------------------------------------------
+
+    simulated_actual_co +=
+        random_float(-1.0f, 1.0f);
+
+    if (simulated_actual_co < 4.0f)
+        simulated_actual_co = 4.0f;
+
+    if (simulated_actual_co > 12.0f)
+        simulated_actual_co = 12.0f;
+
+
+    // -----------------------------------------------------
+    // Simulated battery
+    //
+    // This remains simulation only.
+    //
+    // Real battery measurement will be added later.
+    // -----------------------------------------------------
+
+    if ((rand() % 10) == 0) {
+
+        simulated_battery--;
+
+        if (simulated_battery < 20)
+            simulated_battery = 100;
+    }
+}
+
+
+// =========================================================
+// GET ACTUAL CO
+// =========================================================
 
 static float getActualCO(void)
 {
@@ -1057,13 +1448,15 @@ static float getActualCO(void)
 }
 
 
+// =========================================================
+// GET PREDICTED CO
+// =========================================================
+
 static float getPredictedCO(void)
 {
-    // Simulate an AI/model prediction that is close to the
-    // measured CO value but not exactly identical.
-
     float prediction =
-        simulated_actual_co + random_float(-0.8f, 0.8f);
+        simulated_actual_co +
+        random_float(-0.8f, 0.8f);
 
     if (prediction < 0.0f)
         prediction = 0.0f;
@@ -1071,11 +1464,20 @@ static float getPredictedCO(void)
     return prediction;
 }
 
+
+// =========================================================
+// GET TEMPERATURE
+// =========================================================
+
 static float getTemperature(void)
 {
     return real_temperature;
 }
 
+
+// =========================================================
+// GET HUMIDITY
+// =========================================================
 
 static float getHumidity(void)
 {
@@ -1083,22 +1485,34 @@ static float getHumidity(void)
 }
 
 
+// =========================================================
+// GET BATTERY
+// =========================================================
+
 static int getBatteryPercent(void)
 {
     return simulated_battery;
 }
 
 
+// =========================================================
+// GET TIMESTAMP
+// =========================================================
+
 static const char *getTimestamp(void)
 {
     static char timestamp[32];
 
     time_t now;
+
     struct tm timeinfo;
 
     time(&now);
 
-    gmtime_r(&now, &timeinfo);
+    gmtime_r(
+        &now,
+        &timeinfo
+    );
 
     strftime(
         timestamp,
@@ -1110,141 +1524,423 @@ static const char *getTimestamp(void)
     return timestamp;
 }
 
+
+// =========================================================
+// BUILD TELEMETRY JSON
+// =========================================================
+
+static int buildTelemetryJSON(
+    char *buffer,
+    size_t buffer_size)
+{
+    updateBME280();
+
+    updateSimulatedSensors();
+
+    float actualCO =
+        getActualCO();
+
+    float predictedCO =
+        getPredictedCO();
+
+    float temperature =
+        getTemperature();
+
+    float humidity =
+        getHumidity();
+
+    float pressure =
+        real_pressure;
+
+    int battery =
+        getBatteryPercent();
+
+
+    int length =
+        snprintf(
+            buffer,
+            buffer_size,
+
+            "{"
+            "\"device_id\":\"%s\","
+            "\"timestamp\":\"%s\","
+            "\"sensor_status\":\"online\","
+            "\"alarm\":false,"
+            "\"predicted_co_ppm\":%.1f,"
+            "\"actual_co_ppm\":%.1f,"
+            "\"temperature\":%.1f,"
+            "\"humidity\":%.1f,"
+            "\"pressure\":%.2f,"
+            "\"battery_percent\":%d"
+            "}",
+
+            DEVICE_ID,
+
+            getTimestamp(),
+
+            predictedCO,
+
+            actualCO,
+
+            temperature,
+
+            humidity,
+
+            pressure,
+
+            battery
+        );
+
+
+    if (
+        length < 0 ||
+        (size_t)length >= buffer_size
+    ) {
+
+        ESP_LOGE(
+            TAG,
+            "Telemetry JSON buffer too small"
+        );
+
+        return -1;
+    }
+
+    return length;
+}
+
+
+// =========================================================
+// SEND TELEMETRY
+// =========================================================
+
 static void sendTelemetry(void)
 {
     char json[512];
 
-    int json_length = buildTelemetryJSON(json, sizeof(json));
+    int json_length =
+        buildTelemetryJSON(
+            json,
+            sizeof(json)
+        );
 
     if (json_length < 0) {
         return;
     }
 
+
     struct sockaddr_in6 destination = {0};
 
-    destination.sin6_family = AF_INET6;
-    destination.sin6_port = htons(THREAD_TELEMETRY_PORT);
+    destination.sin6_family =
+        AF_INET6;
 
-    if (inet_pton(AF_INET6, THREAD_BORDER_ROUTER_IPV6,
-                  &destination.sin6_addr) != 1) {
-        ESP_LOGE(TAG, "Invalid Node 2 IPv6 address: %s",
-                 THREAD_BORDER_ROUTER_IPV6);
+    destination.sin6_port =
+        htons(
+            THREAD_TELEMETRY_PORT
+        );
+
+
+    if (
+        inet_pton(
+            AF_INET6,
+            THREAD_BORDER_ROUTER_IPV6,
+            &destination.sin6_addr
+        ) != 1
+    ) {
+
+        ESP_LOGE(
+            TAG,
+            "Invalid Node 2 IPv6 address: %s",
+            THREAD_BORDER_ROUTER_IPV6
+        );
+
         return;
     }
 
-    int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+
+    int sock =
+        socket(
+            AF_INET6,
+            SOCK_DGRAM,
+            IPPROTO_UDP
+        );
 
     if (sock < 0) {
-        ESP_LOGE(TAG, "Failed to create UDP socket: errno %d", errno);
+
+        ESP_LOGE(
+            TAG,
+            "Failed to create UDP socket: errno %d",
+            errno
+        );
+
         return;
     }
 
-    int result = sendto(
-        sock,
-        json,
-        json_length,
-        0,
-        (struct sockaddr *)&destination,
-        sizeof(destination)
-    );
+
+    int result =
+        sendto(
+            sock,
+            json,
+            json_length,
+            0,
+            (struct sockaddr *)&destination,
+            sizeof(destination)
+        );
+
 
     if (result < 0) {
 
-        ESP_LOGE(TAG,
-                "Failed to send telemetry: errno %d",
-                errno);
+        ESP_LOGE(
+            TAG,
+            "Failed to send telemetry: errno %d",
+            errno
+        );
 
     } else {
 
-        ESP_LOGI(TAG,
-                "Telemetry sent to [%s]:%d (%d bytes)",
-                THREAD_BORDER_ROUTER_IPV6,
-                THREAD_TELEMETRY_PORT,
-                result);
+        ESP_LOGI(
+            TAG,
+            "Telemetry sent to [%s]:%d (%d bytes)",
+            THREAD_BORDER_ROUTER_IPV6,
+            THREAD_TELEMETRY_PORT,
+            result
+        );
 
-        ESP_LOGI(TAG, "Payload: %s", json);
+        ESP_LOGI(
+            TAG,
+            "Payload: %s",
+            json
+        );
 
-        led_green_blink();
+
+        // -------------------------------------------------
+        // BLUE FLASH
+        //
+        // Blue = successful telemetry transmission
+        // -------------------------------------------------
+
+        led_blue_flash();
     }
+
 
     close(sock);
 }
 
+
+// =========================================================
+// TELEMETRY TASK
+// =========================================================
+
 static void telemetry_task(void *arg)
 {
+    bool thread_was_attached = false;
+
+
     while (true) {
 
-        otInstance *instance = esp_openthread_get_instance();
+        otInstance *instance =
+            esp_openthread_get_instance();
+
 
         if (instance != NULL) {
 
-            otDeviceRole role = otThreadGetDeviceRole(instance);
+            otDeviceRole role =
+                otThreadGetDeviceRole(
+                    instance
+                );
 
-            if (role != OT_DEVICE_ROLE_DISABLED &&
-                role != OT_DEVICE_ROLE_DETACHED) {
 
-                led_blue();
+            bool attached =
+                (
+                    role != OT_DEVICE_ROLE_DISABLED &&
+                    role != OT_DEVICE_ROLE_DETACHED
+                );
+
+
+            // =============================================
+            // THREAD ATTACHED
+            // =============================================
+
+            if (attached) {
+
+                /*
+                 * Only flash green once when the device
+                 * first becomes attached.
+                 */
+
+                if (!thread_was_attached) {
+
+                    ESP_LOGI(
+                        TAG,
+                        "Thread attached - device ready"
+                    );
+
+                    led_green_flash();
+
+                    thread_was_attached = true;
+                }
+
+
+                // -----------------------------------------
+                // Send telemetry
+                // -----------------------------------------
 
                 sendTelemetry();
 
+
             } else {
 
-                led_red();
+                // =========================================
+                // THREAD NOT ATTACHED
+                // =========================================
 
-                ESP_LOGI(TAG,
-                         "Thread not attached yet, telemetry waiting...");
+                if (thread_was_attached) {
+
+                    ESP_LOGW(
+                        TAG,
+                        "Thread detached"
+                    );
+
+                    thread_was_attached = false;
+                }
+
+                ESP_LOGI(
+                    TAG,
+                    "Thread not attached yet, telemetry waiting..."
+                );
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
+
+        /*
+         * =================================================
+         * POWER OPTIMISATION
+         * =================================================
+         *
+         * The task blocks here until the next telemetry
+         * cycle.
+         *
+         * With ESP-IDF power management / automatic
+         * Light-sleep enabled in the project configuration,
+         * the ESP32-H2 can enter Light-sleep while the
+         * application has no work to perform.
+         */
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TELEMETRY_INTERVAL_MS
+            )
+        );
     }
 }
 
-static esp_netif_t *init_openthread_netif(const esp_openthread_platform_config_t *config)
+
+// =========================================================
+// OPENTHREAD NETIF
+// =========================================================
+
+static esp_netif_t *init_openthread_netif(
+    const esp_openthread_platform_config_t *config)
 {
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
-    esp_netif_t *netif = esp_netif_new(&cfg);
+    esp_netif_config_t cfg =
+        ESP_NETIF_DEFAULT_OPENTHREAD();
+
+    esp_netif_t *netif =
+        esp_netif_new(&cfg);
+
     assert(netif != NULL);
-    ESP_ERROR_CHECK(esp_netif_attach(netif, esp_openthread_netif_glue_init(config)));
+
+    ESP_ERROR_CHECK(
+        esp_netif_attach(
+            netif,
+            esp_openthread_netif_glue_init(
+                config
+            )
+        )
+    );
 
     return netif;
 }
 
+
+// =========================================================
+// OPENTHREAD WORKER
+// =========================================================
+
 static void ot_task_worker(void *aContext)
 {
     esp_openthread_platform_config_t config = {
-        .radio_config = ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
-        .port_config = ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
+
+        .radio_config =
+            ESP_OPENTHREAD_DEFAULT_RADIO_CONFIG(),
+
+        .host_config =
+            ESP_OPENTHREAD_DEFAULT_HOST_CONFIG(),
+
+        .port_config =
+            ESP_OPENTHREAD_DEFAULT_PORT_CONFIG(),
     };
 
-    // Initialize the OpenThread stack
-    ESP_ERROR_CHECK(esp_openthread_init(&config));
+
+    // -----------------------------------------------------
+    // Initialise OpenThread
+    // -----------------------------------------------------
+
+    ESP_ERROR_CHECK(
+        esp_openthread_init(
+            &config
+        )
+    );
+
 
 #if CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC
-    // The OpenThread log level directly matches ESP log level
-    (void)otLoggingSetLevel(CONFIG_LOG_DEFAULT_LEVEL);
+
+    (void)otLoggingSetLevel(
+        CONFIG_LOG_DEFAULT_LEVEL
+    );
+
 #endif
 
-    // Initialize the OpenThread cli
+
+    // -----------------------------------------------------
+    // OpenThread CLI
+    // -----------------------------------------------------
+
 #if CONFIG_OPENTHREAD_CLI
+
     esp_openthread_cli_init();
+
 #endif
+
+
+    // -----------------------------------------------------
+    // Network interface
+    // -----------------------------------------------------
 
     esp_netif_t *openthread_netif;
 
-    // Initialize the esp_netif bindings
-    openthread_netif = init_openthread_netif(&config);
-    esp_netif_set_default_netif(openthread_netif);
+    openthread_netif =
+        init_openthread_netif(
+            &config
+        );
+
+    esp_netif_set_default_netif(
+        openthread_netif
+    );
+
 
 #if CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
-    esp_cli_custom_command_init();
-#endif // CONFIG_OPENTHREAD_CLI_ESP_EXTENSION
 
-    // Run the main loop
-#if CONFIG_OPENTHREAD_CLI
-    esp_openthread_cli_create_task();
+    esp_cli_custom_command_init();
+
 #endif
+
+
+#if CONFIG_OPENTHREAD_CLI
+
+    esp_openthread_cli_create_task();
+
+#endif
+
 
     // =====================================================
     // START THREAD AUTOMATICALLY
@@ -1255,21 +1951,41 @@ static void ot_task_worker(void *aContext)
         "Starting Thread automatically from Kconfig dataset"
     );
 
+
     otOperationalDatasetTlvs dataset;
 
-    if (load_gateway_dataset(&dataset) != 0) {
-        ESP_LOGE(TAG, "Failed to load gateway Thread dataset");
+
+    if (
+        load_gateway_dataset(
+            &dataset
+        ) != 0
+    ) {
+
+        ESP_LOGE(
+            TAG,
+            "Failed to load gateway Thread dataset"
+        );
+
         abort();
     }
+
 
     ESP_LOGI(
         TAG,
         "Starting Thread using gateway Active Operational Dataset"
     );
 
+
     ESP_ERROR_CHECK(
-        esp_openthread_auto_start(&dataset)
+        esp_openthread_auto_start(
+            &dataset
+        )
     );
+
+
+    // -----------------------------------------------------
+    // Telemetry task
+    // -----------------------------------------------------
 
     xTaskCreate(
         telemetry_task,
@@ -1280,42 +1996,92 @@ static void ot_task_worker(void *aContext)
         NULL
     );
 
+
+    // -----------------------------------------------------
+    // OpenThread main loop
+    // -----------------------------------------------------
+
     esp_openthread_launch_mainloop();
 
+
+    // -----------------------------------------------------
     // Clean up
+    // -----------------------------------------------------
+
     esp_openthread_netif_glue_deinit();
-    esp_netif_destroy(openthread_netif);
+
+    esp_netif_destroy(
+        openthread_netif
+    );
 
     esp_vfs_eventfd_unregister();
+
     vTaskDelete(NULL);
 }
 
+
+// =========================================================
+// APPLICATION MAIN
+// =========================================================
+
 void app_main(void)
 {
-    //
-    led_init();
-    led_red();
+    // =====================================================
+    // LED INITIALISATION
+    // =====================================================
 
-    // Used eventfds:
-    // * netif
-    // * ot task queue
-    // * radio driver
+    led_init();
+
+
+    // =====================================================
+    // BOOT RED FLASH
+    //
+    // RED = device booting
+    // =====================================================
+
+    led_red_flash();
+
+
+    // =====================================================
+    // EVENTFD
+    // =====================================================
+
     esp_vfs_eventfd_config_t eventfd_config = {
         .max_fds = 3,
     };
 
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_vfs_eventfd_register(&eventfd_config));
 
     // =====================================================
-    // INITIALIZE I2C BUS
+    // ESP SYSTEM INITIALISATION
+    // =====================================================
+
+    ESP_ERROR_CHECK(
+        nvs_flash_init()
+    );
+
+    ESP_ERROR_CHECK(
+        esp_event_loop_create_default()
+    );
+
+    ESP_ERROR_CHECK(
+        esp_netif_init()
+    );
+
+    ESP_ERROR_CHECK(
+        esp_vfs_eventfd_register(
+            &eventfd_config
+        )
+    );
+
+
+    // =====================================================
+    // INITIALISE I2C BUS
     // =====================================================
 
     ESP_ERROR_CHECK(
         bme280_i2c_bus_init()
     );
+
 
     // =====================================================
     // SCAN I2C BUS
@@ -1323,11 +2089,14 @@ void app_main(void)
 
     i2c_scan();
 
+
     // =====================================================
-    // INITIALIZE BME280
+    // INITIALISE BME280
     // =====================================================
 
-    esp_err_t bme_err = bme280_init();
+    esp_err_t bme_err =
+        bme280_init();
+
 
     if (bme_err != ESP_OK) {
 
@@ -1339,7 +2108,7 @@ void app_main(void)
 
         ESP_LOGE(
             TAG,
-            "Thread telemetry will continue, but temperature/humidity will remain invalid."
+            "Thread telemetry will continue, but temperature/humidity/pressure may be invalid."
         );
 
     } else {
@@ -1349,6 +2118,11 @@ void app_main(void)
             "BME280 sensor ready."
         );
     }
+
+
+    // =====================================================
+    // START OPENTHREAD
+    // =====================================================
 
     xTaskCreate(
         ot_task_worker,
