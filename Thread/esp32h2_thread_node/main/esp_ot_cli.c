@@ -51,8 +51,10 @@
 #include "esp_openthread_types.h"
 #include "esp_ot_config.h"
 #include "esp_vfs_eventfd.h"
+#include "esp_mac.h"
 #include "driver/uart.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/uart_types.h"
@@ -200,15 +202,40 @@ static esp_err_t bme280_i2c_device_init(void);
  * 10 minutes:
  *   10 * 60 * 1000
  *
- * Current battery-optimised setting:
- *   5 minutes
+ * Current optimised setting:
+ *   1 minute
  */
-#define TELEMETRY_INTERVAL_MS (5 * 60 * 1000)
+#define TELEMETRY_INTERVAL_MS (1 * 60 * 1000)
 
 #define THREAD_BORDER_ROUTER_IPV6 \
     "fdde:ad00:beef:0:6156:1314:fcbf:27b6"
 
-#define DEVICE_ID "CBP-00336"
+// =========================================================
+// DEVICE / BOARD IDENTIFICATION
+// =========================================================
+
+#define WAVESHARE_DEVICE_ID "CBP-00336"
+#define OLIMEX_DEVICE_ID    "CBP-00400"
+
+// =========================================================
+// KNOWN BOARD MAC ADDRESSES
+// =========================================================
+
+static const uint8_t WAVESHARE_MAC[6] = {
+    0x48, 0x31, 0xB7, 0xC5, 0x6D, 0x59
+};
+
+static const uint8_t OLIMEX_MAC[6] = {
+    0x74, 0x4D, 0xBD, 0x60, 0x94, 0x03
+};
+
+static char device_id[16] = WAVESHARE_DEVICE_ID;
+static bool device_is_olimex = false;
+static uint8_t device_mac[6] = {0};
+
+static void identify_device(void);
+static bool is_olimex_mac(const uint8_t *mac);
+static void print_device_mac(void);
 
 #define TAG "ot_esp_cli"
 
@@ -352,6 +379,187 @@ static int load_gateway_dataset(
     return 0;
 }
 
+// =========================================================
+// CHECK WHETHER MAC BELONGS TO OLIMEX
+// =========================================================
+
+static bool is_olimex_mac(const uint8_t *mac)
+{
+    return (
+        memcmp(
+            mac,
+            OLIMEX_MAC,
+            sizeof(OLIMEX_MAC)
+        ) == 0
+    );
+}
+
+// =========================================================
+// CHECK WHETHER MAC BELONGS TO WAVESHARE
+// =========================================================
+
+static bool is_waveshare_mac(const uint8_t *mac)
+{
+    return (
+        memcmp(
+            mac,
+            WAVESHARE_MAC,
+            sizeof(WAVESHARE_MAC)
+        ) == 0
+    );
+}
+
+
+
+// =========================================================
+// PRINT MAC ADDRESS
+// =========================================================
+
+static void print_device_mac(void)
+{
+    ESP_LOGI(
+        TAG,
+        "Device MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+        device_mac[0],
+        device_mac[1],
+        device_mac[2],
+        device_mac[3],
+        device_mac[4],
+        device_mac[5]
+    );
+}
+
+
+// =========================================================
+// IDENTIFY BOARD / DEVICE
+// =========================================================
+
+static void identify_device(void)
+{
+    esp_err_t err =
+        esp_read_mac(
+            device_mac,
+            ESP_MAC_BASE
+        );
+
+    if (err != ESP_OK) {
+
+        ESP_LOGE(
+            TAG,
+            "Failed to read device MAC: %s",
+            esp_err_to_name(err)
+        );
+
+        device_is_olimex = false;
+
+        strncpy(
+            device_id,
+            WAVESHARE_DEVICE_ID,
+            sizeof(device_id) - 1
+        );
+
+        device_id[
+            sizeof(device_id) - 1
+        ] = '\0';
+
+        return;
+    }
+
+    print_device_mac();
+
+
+    // =====================================================
+    // OLIMEX
+    // =====================================================
+
+    if (is_olimex_mac(device_mac)) {
+
+        device_is_olimex = true;
+
+        strncpy(
+            device_id,
+            OLIMEX_DEVICE_ID,
+            sizeof(device_id) - 1
+        );
+
+        device_id[
+            sizeof(device_id) - 1
+        ] = '\0';
+
+        ESP_LOGI(
+            TAG,
+            "Board identified as OLIMEX"
+        );
+
+        ESP_LOGI(
+            TAG,
+            "Device ID: %s",
+            device_id
+        );
+
+        return;
+    }
+
+
+    // =====================================================
+    // WAVESHARE
+    // =====================================================
+
+    if (is_waveshare_mac(device_mac)) {
+
+        device_is_olimex = false;
+
+        strncpy(
+            device_id,
+            WAVESHARE_DEVICE_ID,
+            sizeof(device_id) - 1
+        );
+
+        device_id[
+            sizeof(device_id) - 1
+        ] = '\0';
+
+        ESP_LOGI(
+            TAG,
+            "Board identified as WAVESHARE"
+        );
+
+        ESP_LOGI(
+            TAG,
+            "Device ID: %s",
+            device_id
+        );
+
+        return;
+    }
+
+
+    // =====================================================
+    // UNKNOWN BOARD
+    // =====================================================
+
+    ESP_LOGW(
+        TAG,
+        "Unknown board MAC address!"
+    );
+
+    ESP_LOGW(
+        TAG,
+        "Defaulting to WAVESHARE LED configuration"
+    );
+
+    device_is_olimex = false;
+
+    strncpy(
+        device_id,
+        WAVESHARE_DEVICE_ID,
+        sizeof(device_id) - 1
+    );
+
+    device_id[
+        sizeof(device_id) - 1
+    ] = '\0';
+}
 
 // =========================================================
 // LED INITIALISATION
@@ -359,6 +567,51 @@ static int load_gateway_dataset(
 
 static void led_init(void)
 {
+    // =====================================================
+    // OLIMEX
+    //
+    // GPIO8 drives the onboard User LED directly.
+    //
+    // Olimex LED is ACTIVE LOW:
+    //   LOW  = ON
+    //   HIGH = OFF
+    // =====================================================
+
+    if (device_is_olimex) {
+
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << LED_GPIO),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+
+        ESP_ERROR_CHECK(
+            gpio_config(&io_conf)
+        );
+
+        // LED OFF
+        gpio_set_level(
+            LED_GPIO,
+            1
+        );
+
+        ESP_LOGI(
+            TAG,
+            "Olimex LED initialized on GPIO8 (active LOW)"
+        );
+
+        return;
+    }
+
+
+    // =====================================================
+    // WAVESHARE
+    //
+    // Existing addressable RGB LED using RMT.
+    // =====================================================
+
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_GPIO,
         .max_leds = LED_COUNT,
@@ -386,6 +639,11 @@ static void led_init(void)
     ESP_ERROR_CHECK(
         led_strip_refresh(led_strip)
     );
+
+    ESP_LOGI(
+        TAG,
+        "Waveshare RGB LED initialized using RMT"
+    );
 }
 
 
@@ -395,6 +653,18 @@ static void led_init(void)
 
 static void led_off(void)
 {
+    if (device_is_olimex) {
+
+        // Olimex LED is active LOW
+        gpio_set_level(
+            LED_GPIO,
+            1
+        );
+
+        return;
+    }
+
+    // Waveshare RGB LED
     ESP_ERROR_CHECK(
         led_strip_clear(led_strip)
     );
@@ -411,6 +681,20 @@ static void led_off(void)
 
 static void led_red(void)
 {
+    if (device_is_olimex) {
+
+        // Olimex:
+        // GPIO LOW = LED ON
+
+        gpio_set_level(
+            LED_GPIO,
+            0
+        );
+
+        return;
+    }
+
+    // Waveshare RGB LED
     ESP_ERROR_CHECK(
         led_strip_set_pixel(
             led_strip,
@@ -433,6 +717,20 @@ static void led_red(void)
 
 static void led_green(void)
 {
+    if (device_is_olimex) {
+
+        // Olimex has one GPIO-controlled user LED.
+        // LOW = ON
+
+        gpio_set_level(
+            LED_GPIO,
+            0
+        );
+
+        return;
+    }
+
+    // Waveshare RGB LED
     ESP_ERROR_CHECK(
         led_strip_set_pixel(
             led_strip,
@@ -455,6 +753,20 @@ static void led_green(void)
 
 static void led_blue(void)
 {
+    if (device_is_olimex) {
+
+        // Olimex has no blue channel.
+        // Use the user LED as the status indicator.
+
+        gpio_set_level(
+            LED_GPIO,
+            0
+        );
+
+        return;
+    }
+
+    // Waveshare RGB LED
     ESP_ERROR_CHECK(
         led_strip_set_pixel(
             led_strip,
@@ -1574,7 +1886,7 @@ static int buildTelemetryJSON(
             "\"battery_percent\":%d"
             "}",
 
-            DEVICE_ID,
+            device_id,
 
             getTimestamp(),
 
@@ -1730,16 +2042,18 @@ static void sendTelemetry(void)
 // TELEMETRY TASK
 // =========================================================
 
+// =========================================================
+// TELEMETRY TASK
+// =========================================================
+
 static void telemetry_task(void *arg)
 {
     bool thread_was_attached = false;
-
 
     while (true) {
 
         otInstance *instance =
             esp_openthread_get_instance();
-
 
         if (instance != NULL) {
 
@@ -1748,24 +2062,21 @@ static void telemetry_task(void *arg)
                     instance
                 );
 
-
             bool attached =
                 (
                     role != OT_DEVICE_ROLE_DISABLED &&
                     role != OT_DEVICE_ROLE_DETACHED
                 );
 
-
-            // =============================================
+            // =================================================
             // THREAD ATTACHED
-            // =============================================
+            // =================================================
 
             if (attached) {
 
-                /*
-                 * Only flash green once when the device
-                 * first becomes attached.
-                 */
+                // ---------------------------------------------
+                // FIRST ATTACH
+                // ---------------------------------------------
 
                 if (!thread_was_attached) {
 
@@ -1777,21 +2088,61 @@ static void telemetry_task(void *arg)
                     led_green_flash();
 
                     thread_was_attached = true;
+
+                    // -----------------------------------------
+                    // IMPORTANT:
+                    //
+                    // SEND IMMEDIATELY AFTER ATTACH
+                    // -----------------------------------------
+
+                    ESP_LOGI(
+                        TAG,
+                        "Sending initial telemetry immediately after Thread attach"
+                    );
+
+                    sendTelemetry();
+
+                    // -----------------------------------------
+                    // Wait until the NEXT telemetry interval.
+                    //
+                    // The first packet has already been sent.
+                    // -----------------------------------------
+
+                    vTaskDelay(
+                        pdMS_TO_TICKS(
+                            TELEMETRY_INTERVAL_MS
+                        )
+                    );
+
+                    continue;
                 }
 
+                // ---------------------------------------------
+                // NORMAL PERIODIC TELEMETRY
+                // ---------------------------------------------
 
-                // -----------------------------------------
-                // Send telemetry
-                // -----------------------------------------
+                ESP_LOGI(
+                    TAG,
+                    "Sending periodic telemetry"
+                );
 
                 sendTelemetry();
 
+                // ---------------------------------------------
+                // Wait for next telemetry cycle
+                // ---------------------------------------------
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        TELEMETRY_INTERVAL_MS
+                    )
+                );
 
             } else {
 
-                // =========================================
+                // =================================================
                 // THREAD NOT ATTACHED
-                // =========================================
+                // =================================================
 
                 if (thread_was_attached) {
 
@@ -1805,34 +2156,39 @@ static void telemetry_task(void *arg)
 
                 ESP_LOGI(
                     TAG,
-                    "Thread not attached yet, telemetry waiting..."
+                    "Thread not attached yet, waiting..."
+                );
+
+                // ---------------------------------------------
+                // IMPORTANT:
+                //
+                // Do NOT wait 5 minutes here.
+                //
+                // Check again in 1 second so we can detect
+                // attachment almost immediately.
+                // ---------------------------------------------
+                vTaskDelay(
+                    pdMS_TO_TICKS(1000)
                 );
             }
+
+        } else {
+
+            // =================================================
+            // OPENTHREAD INSTANCE NOT READY
+            // =================================================
+
+            ESP_LOGI(
+                TAG,
+                "OpenThread instance not ready yet"
+            );
+
+            vTaskDelay(
+                pdMS_TO_TICKS(1000)
+            );
         }
-
-
-        /*
-         * =================================================
-         * POWER OPTIMISATION
-         * =================================================
-         *
-         * The task blocks here until the next telemetry
-         * cycle.
-         *
-         * With ESP-IDF power management / automatic
-         * Light-sleep enabled in the project configuration,
-         * the ESP32-H2 can enter Light-sleep while the
-         * application has no work to perform.
-         */
-
-        vTaskDelay(
-            pdMS_TO_TICKS(
-                TELEMETRY_INTERVAL_MS
-            )
-        );
     }
 }
-
 
 // =========================================================
 // OPENTHREAD NETIF
@@ -2026,6 +2382,12 @@ static void ot_task_worker(void *aContext)
 
 void app_main(void)
 {
+    // =====================================================
+    // IDENTIFY BOARD FROM MAC
+    // =====================================================
+
+    identify_device();
+
     // =====================================================
     // LED INITIALISATION
     // =====================================================
