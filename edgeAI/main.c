@@ -38,6 +38,14 @@
 #include "mxc_delay.h"
 #include "led.h"
 
+/******************************************************************************
+ * LED CONFIGURATION
+ ******************************************************************************/
+
+#ifndef LED_BLUE
+#define LED_BLUE LED_GREEN
+#endif
+
 
 /******************************************************************************
  * CONFIGURATION
@@ -88,6 +96,12 @@
 #define SENSOR_TIMEOUT_MS       5000
 #define PROCESS_PERIOD_MS       10
 
+/*
+ * NEW:
+ * Amount of time the reading LED stays on.
+ */
+#define READING_LED_TIME_MS     100
+
 
 /******************************************************************************
  * HOST PROTOCOL
@@ -101,7 +115,7 @@
 #define MSG_HEARTBEAT           0x01
 #define MSG_CO_STATUS           0x02
 #define MSG_STATE_CHANGE        0x03
-#define MSG_SENSOR_FAULT       0x04
+#define MSG_SENSOR_FAULT        0x04
 #define MSG_DEVICE_INFO         0x05
 
 
@@ -207,6 +221,22 @@ static uint16_t g_sequence = 0;
 static uint32_t g_valid_frames = 0;
 
 static uint32_t g_invalid_frames = 0;
+
+
+/******************************************************************************
+ * NEW: RGB READING LED STATE
+ ******************************************************************************/
+
+/*
+ * Counts valid ZE07 readings.
+ *
+ * 1 -> RED
+ * 2 -> GREEN
+ * 3 -> BLUE
+ * 4 -> RED
+ * ...
+ */
+static uint32_t g_reading_number = 0;
 
 
 /******************************************************************************
@@ -978,6 +1008,82 @@ static int host_uart_init(void)
 
 
 /******************************************************************************
+ * NEW: DISPLAY READING LED
+ *
+ * Cycles through:
+ *
+ *     RED -> GREEN -> BLUE -> RED -> ...
+ *
+ * This function is called only after a VALID ZE07 frame
+ * and VALID CO value have been received.
+ ******************************************************************************/
+
+static void display_reading_led(void)
+{
+    /*
+     * Turn all LEDs off first.
+     */
+    LED_Off(LED_RED);
+    LED_Off(LED_GREEN);
+    LED_Off(LED_BLUE);
+
+
+    /*
+     * Select LED based on reading number.
+     *
+     * g_reading_number starts at 1.
+     *
+     * 1 % 3 -> RED
+     * 2 % 3 -> GREEN
+     * 0 % 3 -> BLUE
+     */
+    switch (g_reading_number % 3) {
+
+        case 1:
+
+            LED_On(LED_RED);
+
+            break;
+
+
+        case 2:
+
+            LED_On(LED_GREEN);
+
+            break;
+
+
+        case 0:
+
+            LED_On(LED_BLUE);
+
+            break;
+    }
+
+
+    /*
+     * Keep the LED visible briefly.
+     */
+    MXC_Delay(
+        MXC_DELAY_MSEC(
+            READING_LED_TIME_MS
+        )
+    );
+
+
+    /*
+     * Turn reading LED off.
+     *
+     * This allows the next reading to produce a
+     * clearly visible LED event.
+     */
+    LED_Off(LED_RED);
+    LED_Off(LED_GREEN);
+    LED_Off(LED_BLUE);
+}
+
+
+/******************************************************************************
  * PROCESS SENSOR
  ******************************************************************************/
 
@@ -989,8 +1095,8 @@ static void process_sensor(void)
     /*
      * Read exactly one complete ZE07 frame.
      *
-     * This is intentionally identical in principle to the
-     * known-working ZE07-only program.
+     * This blocks until a complete frame arrives,
+     * exactly like the known-good sensor program.
      */
     result =
         ze07_read_frame();
@@ -1065,6 +1171,13 @@ static void process_sensor(void)
 
 
     /**************************************************************************
+     * NEW: Count valid reading
+     **************************************************************************/
+
+    g_reading_number++;
+
+
+    /**************************************************************************
      * Evaluate state
      **************************************************************************/
 
@@ -1083,19 +1196,24 @@ static void process_sensor(void)
      **************************************************************************/
 
     printf(
-        "CO: %u.%u ppm | state=%d | sensor=%d\n",
+        "CO: %u.%u ppm | state=%d | sensor=%d | reading=%lu\n",
         g_co_ppm_x10 / 10,
         g_co_ppm_x10 % 10,
         g_co_state,
-        g_sensor_status
+        g_sensor_status,
+        (unsigned long)g_reading_number
     );
 
 
     /**************************************************************************
-     * LED
+     * NEW: RGB reading indication
+     *
+     * Every valid reading cycles:
+     *
+     * RED -> GREEN -> BLUE -> RED -> ...
      **************************************************************************/
 
-    LED_On(LED_GREEN);
+    display_reading_led();
 
 
     /**************************************************************************
@@ -1113,6 +1231,13 @@ static void process_sensor(void)
                 CO_STATE_WARNING ||
             g_co_state ==
                 CO_STATE_ALARM) {
+
+            /*
+             * Warning/alarm overrides the reading LED
+             * and leaves RED on.
+             */
+            LED_Off(LED_GREEN);
+            LED_Off(LED_BLUE);
 
             LED_On(LED_RED);
 
@@ -1153,6 +1278,7 @@ static void process_sensor_health(void)
 
 
                 LED_Off(LED_GREEN);
+                LED_Off(LED_BLUE);
 
                 LED_On(LED_RED);
 
@@ -1188,6 +1314,7 @@ static void process_sensor_health(void)
 
 
             LED_Off(LED_GREEN);
+            LED_Off(LED_BLUE);
 
             LED_On(LED_RED);
 
@@ -1495,6 +1622,15 @@ int main(void)
 
     g_sensor_status =
         SENSOR_STATUS_NO_DATA;
+
+
+    /**************************************************************************
+     * NEW: Initialize RGB LEDs OFF
+     **************************************************************************/
+
+    LED_Off(LED_RED);
+    LED_Off(LED_GREEN);
+    LED_Off(LED_BLUE);
 
 
     /**************************************************************************
