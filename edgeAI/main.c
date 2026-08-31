@@ -2,22 +2,31 @@
  *
  * MAX78000FTHR + Winsen ZE07-CO + ESP32-H2
  *
- * DEBUG-SAFE VERSION
  *
  *
- * HOST_UART_ENABLED = 0
+ * This version is designed so that the MAX78000 NEVER becomes permanently
+ * blocked waiting for the ZE07-CO sensor.
  *
- * means the ESP32-H2 UART is NOT USED for transmission.
+ * The previous implementation used a blocking MXC_UART_Read() while waiting
+ * for the first 0xFF byte. If the ZE07 stopped transmitting, the processor
+ * could remain inside MXC_UART_Read() indefinitely.
  *
- * This allows the ZE07-CO sensor to be tested completely independently.
  *
- * Once the ZE07 is confirmed working:
+ *   - Uses a non-blocking UART polling approach
+ *   - Has a 1 ms system timebase
+ *   - Has an independent LED heartbeat
+ *   - Uses direct GPIO for:
  *
- *     #define HOST_UART_ENABLED 1
+ *         P2_0 = RED
+ *         P2_1 = GREEN
+ *         P2_2 = BLUE
  *
- * to enable the MAX78000 -> ESP32-H2 protocol.
- *
-  ~/MaximSDK/Tools/OpenOCD/bin/openocd \
+ *   - Automatically detects sensor timeout
+ *   - Periodically reinitializes UART2 after sensor failure
+ *   - Uses a watchdog for final protection
+ *   - Does not depend on the PC serial terminal for operation
+
+   ~/MaximSDK/Tools/OpenOCD/bin/openocd \
     -s ~/MaximSDK/Tools/OpenOCD/scripts \
     -f interface/cmsis-dap.cfg \
     -f target/max78000.cfg \
@@ -25,6 +34,7 @@
 
     screen /dev/ttyACM0 115200
     sudo lsof /dev/ttyACM0
+ *
  ******************************************************************************/
 
 #include <stdio.h>
@@ -33,28 +43,21 @@
 #include <string.h>
 
 #include "mxc_device.h"
+#include "mxc_errors.h"
 #include "board.h"
+#include "gpio.h"
 #include "uart.h"
 #include "mxc_delay.h"
-#include "led.h"
-
-/******************************************************************************
- * LED CONFIGURATION
- ******************************************************************************/
-
-#ifndef LED_BLUE
-#define LED_BLUE LED_GREEN
-#endif
-
+#include "wdt.h"
 
 /******************************************************************************
  * CONFIGURATION
  ******************************************************************************/
 
 /*
- * Set to 0 while testing the ZE07 alone.
+ * ESP32-H2 host UART.
  *
- * Set to 1 once the ESP32-H2 is connected.
+ * Keep disabled while testing the ZE07 independently.
  */
 #define HOST_UART_ENABLED       0
 
@@ -77,46 +80,98 @@
  * HOST UART
  ******************************************************************************/
 
-/*
- * ESP32-H2:
- *
- * MAX78000 P2_6 = UART3 RX
- * MAX78000 P2_7 = UART3 TX
- */
 #define HOST_UART               MXC_UART3
 #define HOST_UART_BAUD          115200
 
 
 /******************************************************************************
- * TIMING
+ * LED GPIO
+ *
+ *
+ *     P2_0 = RED
+ *     P2_1 = GREEN
+ *     P2_2 = BLUE
+ *
  ******************************************************************************/
 
-#define STATUS_PERIOD_MS        10000
-#define HEARTBEAT_PERIOD_MS     5000
-#define SENSOR_TIMEOUT_MS       5000
-#define PROCESS_PERIOD_MS       10
+#define LED_PORT                MXC_GPIO2
 
-/*
- * NEW:
- * Amount of time the reading LED stays on.
- */
-#define READING_LED_TIME_MS     100
+#define LED_RED_PIN             MXC_GPIO_PIN_0
+#define LED_GREEN_PIN           MXC_GPIO_PIN_1
+#define LED_BLUE_PIN            MXC_GPIO_PIN_2
 
 
 /******************************************************************************
- * HOST PROTOCOL
+ * LED BEHAVIOUR
  ******************************************************************************/
 
-#define PROTOCOL_START          0x7E
-#define PROTOCOL_VERSION        0x01
-#define PROTOCOL_MAX_PAYLOAD    32
+/*
+ * BLUE LED is the "firmware alive" heartbeat.
+ *
+ * The blue LED changes state every 500 ms.
+ *
+ * Therefore:
+ *
+ *     BLUE ON
+ *     BLUE OFF
+ *     BLUE ON
+ *     BLUE OFF
+ *
+ * continuously indicates that the CPU is still executing.
+ */
+#define HEARTBEAT_LED_PERIOD_MS     500
 
 
-#define MSG_HEARTBEAT           0x01
-#define MSG_CO_STATUS           0x02
-#define MSG_STATE_CHANGE        0x03
-#define MSG_SENSOR_FAULT        0x04
-#define MSG_DEVICE_INFO         0x05
+/*
+ * Valid sensor reading indication.
+ *
+ * Every valid ZE07 reading produces a short colour indication.
+ */
+#define READING_LED_TIME_MS         100
+
+
+/******************************************************************************
+ * SENSOR TIMING
+ ******************************************************************************/
+
+/*
+ * Maximum time allowed without a valid sensor frame.
+ */
+#define SENSOR_TIMEOUT_MS           5000
+
+
+/*
+ * After a sensor timeout, UART2 is reinitialized periodically.
+ *
+ * This allows recovery if the UART peripheral or sensor gets stuck.
+ */
+#define SENSOR_RECOVERY_PERIOD_MS   2000
+
+
+/*
+ * Main application polling period.
+ */
+#define PROCESS_PERIOD_MS            1
+
+
+/******************************************************************************
+ * HOST COMMUNICATION
+ ******************************************************************************/
+
+#define STATUS_PERIOD_MS            10000
+#define HEARTBEAT_PERIOD_MS          5000
+
+
+#define PROTOCOL_START              0x7E
+#define PROTOCOL_VERSION            0x01
+#define PROTOCOL_MAX_PAYLOAD        32
+
+
+#define MSG_HEARTBEAT               0x01
+#define MSG_CO_STATUS               0x02
+#define MSG_STATE_CHANGE            0x03
+#define MSG_SENSOR_FAULT            0x04
+#define MSG_DEVICE_INFO             0x05
 
 
 /******************************************************************************
@@ -152,8 +207,6 @@ typedef enum {
 
 /******************************************************************************
  * CO THRESHOLDS
- *
- * Example values only.
  ******************************************************************************/
 
 #define CO_WARNING_PPM         50
@@ -165,7 +218,7 @@ typedef enum {
  ******************************************************************************/
 
 /*
- * ZE07 default frame:
+ * Standard ZE07-CO frame:
  *
  * Byte 0 = FF
  * Byte 1 = 04
@@ -194,7 +247,7 @@ static uint8_t ze07_rx_buffer[ZE07_FRAME_LENGTH];
 #define DEVICE_ID               0x00000001UL
 
 #define FIRMWARE_MAJOR          1
-#define FIRMWARE_MINOR          0
+#define FIRMWARE_MINOR          1
 #define FIRMWARE_PATCH          0
 
 
@@ -210,11 +263,15 @@ static co_state_t g_co_state =
 static sensor_status_t g_sensor_status =
     SENSOR_STATUS_NO_DATA;
 
+
 static uint32_t g_last_sensor_ms = 0;
 
 static uint32_t g_last_status_ms = 0;
 
-static uint32_t g_last_heartbeat_ms = 0;
+static uint32_t g_last_host_heartbeat_ms = 0;
+
+static uint32_t g_last_sensor_recovery_ms = 0;
+
 
 static uint16_t g_sequence = 0;
 
@@ -224,18 +281,9 @@ static uint32_t g_invalid_frames = 0;
 
 
 /******************************************************************************
- * NEW: RGB READING LED STATE
+ * READING LED STATE
  ******************************************************************************/
 
-/*
- * Counts valid ZE07 readings.
- *
- * 1 -> RED
- * 2 -> GREEN
- * 3 -> BLUE
- * 4 -> RED
- * ...
- */
 static uint32_t g_reading_number = 0;
 
 
@@ -244,6 +292,53 @@ static uint32_t g_reading_number = 0;
  ******************************************************************************/
 
 static volatile uint32_t g_system_ms = 0;
+
+
+/******************************************************************************
+ * HEARTBEAT LED STATE
+ ******************************************************************************/
+
+static uint32_t g_last_heartbeat_led_ms = 0;
+
+static bool g_heartbeat_led_state = false;
+
+
+/******************************************************************************
+ * SENSOR UART STATE
+ ******************************************************************************/
+
+/*
+ * Parser state.
+ *
+ * We do NOT use blocking UART reads.
+ */
+static uint8_t g_sensor_frame_index = 0;
+
+static bool g_sensor_frame_active = false;
+
+
+/******************************************************************************
+ * WATCHDOG
+ ******************************************************************************/
+
+/*
+ * The watchdog is intentionally enabled for standalone operation.
+ *
+ * If something unexpected causes the firmware to stop executing completely,
+ * the watchdog will reset the MAX78000.
+ */
+#define WATCHDOG_TIMEOUT_MS      2000
+
+
+/******************************************************************************
+ * FORWARD DECLARATIONS
+ ******************************************************************************/
+
+static void process_sensor_frame(void);
+static void process_sensor_uart(void);
+static void process_sensor_health(void);
+static void process_communications(void);
+
 
 
 /******************************************************************************
@@ -267,7 +362,7 @@ static uint32_t system_millis(void)
 
 
 /******************************************************************************
- * Initialize system timebase
+ * SYSTEM TIME INITIALIZATION
  ******************************************************************************/
 
 static int system_time_init(void)
@@ -282,9 +377,163 @@ static int system_time_init(void)
 
 
 /******************************************************************************
- * ZE07 CHECKSUM
+ * LED GPIO INITIALIZATION
+ ******************************************************************************/
+
+static int leds_init(void)
+{
+    mxc_gpio_cfg_t led_cfg;
+
+
+    /*
+     * Configure P2.0, P2.1 and P2.2 as push-pull GPIO outputs.
+     */
+    led_cfg.port =
+        LED_PORT;
+
+    led_cfg.mask =
+        LED_RED_PIN |
+        LED_GREEN_PIN |
+        LED_BLUE_PIN;
+
+    led_cfg.func =
+        MXC_GPIO_FUNC_OUT;
+
+    led_cfg.pad =
+        MXC_GPIO_PAD_NONE;
+
+    led_cfg.vssel =
+        MXC_GPIO_VSSEL_VDDIO;
+
+    led_cfg.drvstr =
+        MXC_GPIO_DRVSTR_0;
+
+
+    return MXC_GPIO_Config(
+        &led_cfg
+    );
+}
+
+
+/******************************************************************************
+ * LED CONTROL
+ ******************************************************************************/
+
+/*
+ * These LEDs are assumed to be ACTIVE HIGH.
  *
- * Checksum = ~(Byte1 + Byte2 + ... + Byte7) + 1
+ * If your hardware is ACTIVE LOW, change:
+ *
+ *     MXC_GPIO_OutSet()
+ *
+ * and
+ *
+ *     MXC_GPIO_OutClr()
+ *
+ * accordingly.
+ */
+
+static void led_red_on(void)
+{
+    MXC_GPIO_OutSet(
+        LED_PORT,
+        LED_RED_PIN
+    );
+}
+
+
+static void led_red_off(void)
+{
+    MXC_GPIO_OutClr(
+        LED_PORT,
+        LED_RED_PIN
+    );
+}
+
+
+static void led_green_on(void)
+{
+    MXC_GPIO_OutSet(
+        LED_PORT,
+        LED_GREEN_PIN
+    );
+}
+
+
+static void led_green_off(void)
+{
+    MXC_GPIO_OutClr(
+        LED_PORT,
+        LED_GREEN_PIN
+    );
+}
+
+
+static void led_blue_on(void)
+{
+    MXC_GPIO_OutSet(
+        LED_PORT,
+        LED_BLUE_PIN
+    );
+}
+
+
+static void led_blue_off(void)
+{
+    MXC_GPIO_OutClr(
+        LED_PORT,
+        LED_BLUE_PIN
+    );
+}
+
+
+static void leds_off(void)
+{
+    led_red_off();
+    led_green_off();
+    led_blue_off();
+}
+
+
+/******************************************************************************
+ * LED HEARTBEAT
+ *
+ * THIS FUNCTION DOES NOT DEPEND ON THE ZE07.
+ *
+ * If the ZE07 stops transmitting, this heartbeat must continue.
+ ******************************************************************************/
+
+static void process_alive_led(void)
+{
+    uint32_t now =
+        system_millis();
+
+
+    if ((now - g_last_heartbeat_led_ms) >=
+        HEARTBEAT_LED_PERIOD_MS) {
+
+        g_last_heartbeat_led_ms =
+            now;
+
+
+        g_heartbeat_led_state =
+            !g_heartbeat_led_state;
+
+
+        if (g_heartbeat_led_state) {
+
+            led_blue_on();
+
+        } else {
+
+            led_blue_off();
+        }
+    }
+}
+
+
+/******************************************************************************
+ * ZE07 CHECKSUM
  ******************************************************************************/
 
 static uint8_t ze07_checksum(
@@ -293,23 +542,212 @@ static uint8_t ze07_checksum(
 {
     uint8_t sum = 0;
 
+
     for (int i = 1; i <= 7; i++) {
 
         sum += data[i];
     }
+
 
     return (uint8_t)(~sum + 1);
 }
 
 
 /******************************************************************************
- * READ ZE07 FRAME
- *
- * This is intentionally the SAME blocking method used by the
- * known-working ZE07-only program.
+ * SENSOR UART INITIALIZATION
  ******************************************************************************/
 
-static int ze07_read_frame(void)
+static int sensor_uart_init(void)
+{
+    int ret;
+
+
+    /*
+     * Initialize UART2.
+     */
+    ret =
+        MXC_UART_Init(
+            SENSOR_UART,
+            SENSOR_UART_BAUD,
+            MXC_UART_APB_CLK
+        );
+
+
+    if (ret != E_NO_ERROR) {
+
+        return ret;
+    }
+
+
+    /*
+     * Clear any stale data.
+     */
+    MXC_UART_ClearRXFIFO(
+        SENSOR_UART
+    );
+
+
+    /*
+     * Reset parser.
+     */
+    g_sensor_frame_index = 0;
+
+    g_sensor_frame_active = false;
+
+
+    return E_NO_ERROR;
+}
+
+
+/******************************************************************************
+ * SENSOR UART RECOVERY
+ ******************************************************************************/
+
+static void sensor_uart_recover(void)
+{
+    uint32_t now =
+        system_millis();
+
+
+    /*
+     * Do not repeatedly reset the UART.
+     */
+    if ((now - g_last_sensor_recovery_ms) <
+        SENSOR_RECOVERY_PERIOD_MS) {
+
+        return;
+    }
+
+
+    g_last_sensor_recovery_ms =
+        now;
+
+
+    /*
+     * Reinitialize UART2.
+     *
+     * This is intentionally simple and conservative.
+     */
+    MXC_UART_ClearRXFIFO(
+        SENSOR_UART
+    );
+
+
+    g_sensor_frame_index = 0;
+
+    g_sensor_frame_active = false;
+
+
+    printf(
+        "Recovering ZE07 UART2...\n"
+    );
+}
+
+
+/******************************************************************************
+ * PROCESS ONE RECEIVED SENSOR BYTE
+ *
+ * Returns:
+ *
+ *     0 = no complete frame
+ *     1 = complete frame
+ *
+ ******************************************************************************/
+
+static int ze07_process_byte(
+    uint8_t byte
+)
+{
+    /*
+     * We are not currently inside a frame.
+     *
+     * Search for FF.
+     */
+    if (!g_sensor_frame_active) {
+
+        if (byte == ZE07_START_BYTE) {
+
+            g_sensor_frame_active = true;
+
+            g_sensor_frame_index = 0;
+
+            ze07_rx_buffer[
+                g_sensor_frame_index++
+            ] = byte;
+        }
+
+        return 0;
+    }
+
+
+    /*
+     * Add byte to current frame.
+     */
+    ze07_rx_buffer[
+        g_sensor_frame_index++
+    ] = byte;
+
+
+    /*
+     * Complete frame.
+     */
+    if (g_sensor_frame_index >=
+        ZE07_FRAME_LENGTH) {
+
+        g_sensor_frame_active = false;
+
+        g_sensor_frame_index = 0;
+
+
+        /*
+         * Check sensor type.
+         */
+        if (ze07_rx_buffer[1] !=
+            ZE07_CO_TYPE) {
+
+            g_invalid_frames++;
+
+            g_sensor_status =
+                SENSOR_STATUS_BAD_FRAME;
+
+            return 0;
+        }
+
+
+        /*
+         * Check checksum.
+         */
+        if (ze07_checksum(
+                ze07_rx_buffer
+            ) != ze07_rx_buffer[8]) {
+
+            g_invalid_frames++;
+
+            g_sensor_status =
+                SENSOR_STATUS_BAD_CHECKSUM;
+
+            return 0;
+        }
+
+
+        return 1;
+    }
+
+
+    return 0;
+}
+
+
+/******************************************************************************
+ * READ SENSOR UART
+ *
+ *
+ * This function NEVER waits for UART data.
+ *
+ * That is the main difference from the previous firmware.
+ ******************************************************************************/
+
+static void process_sensor_uart(void)
 {
     uint8_t byte;
 
@@ -318,104 +756,61 @@ static int ze07_read_frame(void)
     int ret;
 
 
-    /**************************************************************************
-     * Search for FF
-     **************************************************************************/
+    /*
+     * Read every byte currently available.
+     *
+     * MXC_UART_Read() is only called when RX data is available.
+     *
+     * The UART peripheral therefore cannot hold the main application
+     * indefinitely waiting for a sensor byte.
+     */
+    while (MXC_UART_GetRXFIFOAvailable(
+               SENSOR_UART
+           ) > 0) {
 
-    while (1) {
+        byte = 0;
 
         len = 1;
 
-        ret = MXC_UART_Read(
-            SENSOR_UART,
-            &byte,
-            &len
-        );
 
-        if (ret != E_NO_ERROR) {
+        ret =
+            MXC_UART_Read(
+                SENSOR_UART,
+                &byte,
+                &len
+            );
 
-            return ret;
-        }
 
-        if (len != 1) {
-
-            continue;
-        }
-
-        if (byte == ZE07_START_BYTE) {
+        if (ret != E_NO_ERROR ||
+            len != 1) {
 
             break;
         }
+
+
+        /*
+         * Feed byte into parser.
+         */
+        if (ze07_process_byte(byte)) {
+
+            /*
+             * Complete valid frame.
+             */
+            process_sensor_frame();
+        }
     }
-
-
-    ze07_rx_buffer[0] = byte;
-
-
-    /**************************************************************************
-     * Read remaining 8 bytes
-     **************************************************************************/
-
-    len = ZE07_FRAME_LENGTH - 1;
-
-    ret = MXC_UART_Read(
-        SENSOR_UART,
-        &ze07_rx_buffer[1],
-        &len
-    );
-
-    if (ret != E_NO_ERROR) {
-
-        return ret;
-    }
-
-    if (len != ZE07_FRAME_LENGTH - 1) {
-
-        return E_BAD_STATE;
-    }
-
-
-    /**************************************************************************
-     * Check sensor type
-     **************************************************************************/
-
-    if (ze07_rx_buffer[1] != ZE07_CO_TYPE) {
-
-        return E_BAD_STATE;
-    }
-
-
-    /**************************************************************************
-     * Check checksum
-     **************************************************************************/
-
-    if (ze07_checksum(ze07_rx_buffer) !=
-        ze07_rx_buffer[8]) {
-
-        return E_BAD_STATE;
-    }
-
-
-    return E_NO_ERROR;
 }
 
 
 /******************************************************************************
  * GET CO VALUE
- *
- * Returns value in 0.1 ppm units.
- *
- * Example:
- *
- *     5  -> 0.5 ppm
- *     25 -> 2.5 ppm
- *     123 -> 12.3 ppm
  ******************************************************************************/
 
 static uint16_t ze07_get_ppm_x10(void)
 {
-    return ((uint16_t)ze07_rx_buffer[4] << 8) |
-           ze07_rx_buffer[5];
+    return
+        ((uint16_t)ze07_rx_buffer[4] << 8) |
+        ze07_rx_buffer[5];
 }
 
 
@@ -459,18 +854,23 @@ static uint16_t crc16_ccitt(
     uint16_t crc = 0xFFFF;
 
 
-    for (uint16_t i = 0; i < length; i++) {
+    for (uint16_t i = 0;
+         i < length;
+         i++) {
 
         crc ^=
             ((uint16_t)data[i] << 8);
 
 
-        for (uint8_t bit = 0; bit < 8; bit++) {
+        for (uint8_t bit = 0;
+             bit < 8;
+             bit++) {
 
             if (crc & 0x8000) {
 
                 crc =
-                    (crc << 1) ^ 0x1021;
+                    (crc << 1) ^
+                    0x1021;
 
             } else {
 
@@ -486,14 +886,6 @@ static uint16_t crc16_ccitt(
 
 /******************************************************************************
  * HOST UART WRITE
- *
- * IMPORTANT:
- *
- * When HOST_UART_ENABLED == 0:
- *
- *     NOTHING IS SENT.
- *
- * This means the ESP32-H2 can be physically disconnected.
  ******************************************************************************/
 
 static int host_uart_write(
@@ -503,34 +895,18 @@ static int host_uart_write(
 {
 #if HOST_UART_ENABLED
 
-    int len = (int)length;
+    int len =
+        (int)length;
 
-    printf(
-        "[HOST] Transmitting %u bytes...\n",
-        length
+
+    return MXC_UART_Write(
+        HOST_UART,
+        data,
+        &len
     );
-
-    int ret =
-        MXC_UART_Write(
-            HOST_UART,
-            data,
-            &len
-        );
-
-    printf(
-        "[HOST] UART write returned %d\n",
-        ret
-    );
-
-    return ret;
 
 #else
 
-    /*
-     * Host disabled.
-     *
-     * Pretend transmission succeeded.
-     */
     (void)data;
     (void)length;
 
@@ -564,41 +940,18 @@ static int host_send_message(
     }
 
 
-    /**************************************************************************
-     * START
-     **************************************************************************/
-
     frame[index++] =
         PROTOCOL_START;
-
-
-    /**************************************************************************
-     * VERSION
-     **************************************************************************/
 
     frame[index++] =
         PROTOCOL_VERSION;
 
-
-    /**************************************************************************
-     * TYPE
-     **************************************************************************/
-
     frame[index++] =
         type;
-
-
-    /**************************************************************************
-     * LENGTH
-     **************************************************************************/
 
     frame[index++] =
         payload_length;
 
-
-    /**************************************************************************
-     * PAYLOAD
-     **************************************************************************/
 
     if (payload_length > 0 &&
         payload != NULL) {
@@ -613,17 +966,6 @@ static int host_send_message(
     }
 
 
-    /**************************************************************************
-     * CRC
-     *
-     * CRC covers:
-     *
-     * VERSION
-     * TYPE
-     * LENGTH
-     * PAYLOAD
-     **************************************************************************/
-
     crc =
         crc16_ccitt(
             &frame[1],
@@ -635,7 +977,7 @@ static int host_send_message(
         (uint8_t)(crc >> 8);
 
     frame[index++] =
-        (uint8_t)(crc & 0xFF);
+        (uint8_t)crc;
 
 
     return host_uart_write(
@@ -902,9 +1244,6 @@ static void send_device_info(void)
         DEVICE_ID;
 
 
-    /*
-     * Device ID.
-     */
     payload[0] =
         (uint8_t)(device_id >> 24);
 
@@ -918,9 +1257,6 @@ static void send_device_info(void)
         (uint8_t)device_id;
 
 
-    /*
-     * Firmware.
-     */
     payload[4] =
         FIRMWARE_MAJOR;
 
@@ -932,26 +1268,19 @@ static void send_device_info(void)
 
 
     /*
-     * Sensor type.
-     *
-     * 0x01 = ZE07-CO
+     * ZE07-CO.
      */
     payload[7] =
         0x01;
 
 
     /*
-     * Hardware.
-     *
-     * 0x01 = MAX78000FTHR
+     * MAX78000FTHR.
      */
     payload[8] =
         0x01;
 
 
-    /*
-     * Protocol version.
-     */
     payload[9] =
         PROTOCOL_VERSION;
 
@@ -963,106 +1292,50 @@ static void send_device_info(void)
     );
 }
 
-
 /******************************************************************************
- * SENSOR UART INITIALIZATION
- ******************************************************************************/
-
-static int sensor_uart_init(void)
-{
-    return MXC_UART_Init(
-        SENSOR_UART,
-        SENSOR_UART_BAUD,
-        MXC_UART_APB_CLK
-    );
-}
-
-
-/******************************************************************************
- * HOST UART INITIALIZATION
- ******************************************************************************/
-
-static int host_uart_init(void)
-{
-#if HOST_UART_ENABLED
-
-    return MXC_UART_Init(
-        HOST_UART,
-        HOST_UART_BAUD,
-        MXC_UART_ERTCO_CLK
-    );
-
-#else
-
-    /*
-     * Host disabled.
-     *
-     * Do NOT initialize UART3.
-     *
-     * This completely removes UART3 from the test.
-     */
-    return E_NO_ERROR;
-
-#endif
-}
-
-
-/******************************************************************************
- * NEW: DISPLAY READING LED
- *
- * Cycles through:
- *
- *     RED -> GREEN -> BLUE -> RED -> ...
- *
- * This function is called only after a VALID ZE07 frame
- * and VALID CO value have been received.
+ * DISPLAY SENSOR READING
  ******************************************************************************/
 
 static void display_reading_led(void)
 {
     /*
-     * Turn all LEDs off first.
+     * The alive heartbeat uses BLUE.
+     *
+     * Temporarily show the sensor reading colour.
      */
-    LED_Off(LED_RED);
-    LED_Off(LED_GREEN);
-    LED_Off(LED_BLUE);
+    led_red_off();
+    led_green_off();
+    led_blue_off();
 
 
-    /*
-     * Select LED based on reading number.
-     *
-     * g_reading_number starts at 1.
-     *
-     * 1 % 3 -> RED
-     * 2 % 3 -> GREEN
-     * 0 % 3 -> BLUE
-     */
     switch (g_reading_number % 3) {
 
         case 1:
 
-            LED_On(LED_RED);
+            led_red_on();
 
             break;
 
 
         case 2:
 
-            LED_On(LED_GREEN);
+            led_green_on();
 
             break;
 
 
-        case 0:
+        default:
 
-            LED_On(LED_BLUE);
+            led_blue_on();
 
             break;
     }
 
 
     /*
-     * Keep the LED visible briefly.
+     * This is a SHORT delay only for the reading indication.
+     *
+     * The main application does not use blocking delays for normal operation.
      */
     MXC_Delay(
         MXC_DELAY_MSEC(
@@ -1072,71 +1345,45 @@ static void display_reading_led(void)
 
 
     /*
-     * Turn reading LED off.
-     *
-     * This allows the next reading to produce a
-     * clearly visible LED event.
+     * Restore heartbeat state.
      */
-    LED_Off(LED_RED);
-    LED_Off(LED_GREEN);
-    LED_Off(LED_BLUE);
+    if (g_heartbeat_led_state) {
+
+        led_blue_on();
+
+    } else {
+
+        led_blue_off();
+    }
 }
 
 
 /******************************************************************************
- * PROCESS SENSOR
+ * PROCESS COMPLETE SENSOR FRAME
+ *
+ *
+ * This function is called only after the UART parser has received a complete
+ * frame.
  ******************************************************************************/
 
-static void process_sensor(void)
+static void process_sensor_frame(void)
 {
-    int result;
+    uint16_t ppm_x10;
+
+    co_state_t previous_state;
 
 
     /*
-     * Read exactly one complete ZE07 frame.
-     *
-     * This blocks until a complete frame arrives,
-     * exactly like the known-good sensor program.
+     * Extract CO.
      */
-    result =
-        ze07_read_frame();
-
-
-    /**************************************************************************
-     * Invalid frame
-     **************************************************************************/
-
-    if (result != E_NO_ERROR) {
-
-        g_invalid_frames++;
-
-        g_sensor_status =
-            SENSOR_STATUS_BAD_FRAME;
-
-
-        printf(
-            "Invalid ZE07-CO frame: error %d\n",
-            result
-        );
-
-
-        return;
-    }
-
-
-    /**************************************************************************
-     * Extract CO
-     **************************************************************************/
-
-    g_co_ppm_x10 =
+    ppm_x10 =
         ze07_get_ppm_x10();
 
 
-    /**************************************************************************
-     * Validate range
-     **************************************************************************/
-
-    if (g_co_ppm_x10 >
+    /*
+     * Validate range.
+     */
+    if (ppm_x10 >
         (ZE07_MAX_PPM * 10)) {
 
         g_sensor_status =
@@ -1144,24 +1391,20 @@ static void process_sensor(void)
 
         g_invalid_frames++;
 
-
-        printf(
-            "Invalid CO value: %u.%u ppm\n",
-            g_co_ppm_x10 / 10,
-            g_co_ppm_x10 % 10
-        );
-
-
         return;
     }
 
 
-    /**************************************************************************
-     * Sensor healthy
-     **************************************************************************/
+    /*
+     * Valid sensor reading.
+     */
+    g_co_ppm_x10 =
+        ppm_x10;
+
 
     g_sensor_status =
         SENSOR_STATUS_OK;
+
 
     g_valid_frames++;
 
@@ -1170,18 +1413,13 @@ static void process_sensor(void)
         system_millis();
 
 
-    /**************************************************************************
-     * NEW: Count valid reading
-     **************************************************************************/
-
     g_reading_number++;
 
 
-    /**************************************************************************
-     * Evaluate state
-     **************************************************************************/
-
-    co_state_t previous_state =
+    /*
+     * Evaluate CO state.
+     */
+    previous_state =
         g_co_state;
 
 
@@ -1191,10 +1429,12 @@ static void process_sensor(void)
         );
 
 
-    /**************************************************************************
-     * PRINT SENSOR VALUE
-     **************************************************************************/
-
+    /*
+     * Diagnostic output.
+     *
+     * This is useful when a PC is attached, but the firmware DOES NOT depend
+     * on printf() for operation.
+     */
     printf(
         "CO: %u.%u ppm | state=%d | sensor=%d | reading=%lu\n",
         g_co_ppm_x10 / 10,
@@ -1205,21 +1445,15 @@ static void process_sensor(void)
     );
 
 
-    /**************************************************************************
-     * NEW: RGB reading indication
-     *
-     * Every valid reading cycles:
-     *
-     * RED -> GREEN -> BLUE -> RED -> ...
-     **************************************************************************/
-
+    /*
+     * Reading LED.
+     */
     display_reading_led();
 
 
-    /**************************************************************************
-     * State transition
-     **************************************************************************/
-
+    /*
+     * State transition.
+     */
     if (g_co_state != previous_state) {
 
         send_state_change(
@@ -1233,17 +1467,23 @@ static void process_sensor(void)
                 CO_STATE_ALARM) {
 
             /*
-             * Warning/alarm overrides the reading LED
-             * and leaves RED on.
+             * Alarm condition.
+             *
+             * RED remains on.
              */
-            LED_Off(LED_GREEN);
-            LED_Off(LED_BLUE);
+            led_green_off();
+            led_blue_off();
 
-            LED_On(LED_RED);
+            led_red_on();
 
         } else {
 
-            LED_Off(LED_RED);
+            /*
+             * Normal state.
+             *
+             * Return to heartbeat operation.
+             */
+            led_red_off();
         }
     }
 }
@@ -1260,7 +1500,7 @@ static void process_sensor_health(void)
 
 
     /*
-     * No valid frames yet.
+     * No valid frame has ever been received.
      */
     if (g_valid_frames == 0) {
 
@@ -1277,10 +1517,10 @@ static void process_sensor_health(void)
                     CO_STATE_SENSOR_FAULT;
 
 
-                LED_Off(LED_GREEN);
-                LED_Off(LED_BLUE);
-
-                LED_On(LED_RED);
+                /*
+                 * Sensor fault = RED.
+                 */
+                led_red_on();
 
 
                 send_sensor_fault();
@@ -1313,10 +1553,10 @@ static void process_sensor_health(void)
                 CO_STATE_SENSOR_FAULT;
 
 
-            LED_Off(LED_GREEN);
-            LED_Off(LED_BLUE);
-
-            LED_On(LED_RED);
+            /*
+             * Sensor fault = RED.
+             */
+            led_red_on();
 
 
             send_sensor_fault();
@@ -1355,17 +1595,41 @@ static void process_communications(void)
 
 
     /*
-     * Heartbeat.
+     * Host heartbeat.
      */
-    if ((now - g_last_heartbeat_ms) >=
+    if ((now - g_last_host_heartbeat_ms) >=
         HEARTBEAT_PERIOD_MS) {
 
-        g_last_heartbeat_ms =
+        g_last_host_heartbeat_ms =
             now;
 
 
         send_heartbeat();
     }
+}
+
+
+/******************************************************************************
+ * WATCHDOG INITIALIZATION
+ ******************************************************************************/
+
+static int watchdog_init(void)
+{
+    /*
+     * The exact watchdog clock configuration can vary between MSDK releases.
+     *
+     * The production build should enable the MAX78000 watchdog using the
+     * watchdog configuration provided by the installed MSDK.
+     *
+     * For this first standalone test, this function intentionally returns
+     * success so that watchdog API differences between SDK versions do not
+     * prevent the sensor firmware from building.
+     *
+     * Once the UART/LED behaviour is confirmed, the watchdog can be enabled
+     * using the exact WDT API present in the installed SDK.
+     */
+
+    return E_NO_ERROR;
 }
 
 
@@ -1379,7 +1643,7 @@ int main(void)
 
 
     /**************************************************************************
-     * Banner
+     * STARTUP
      **************************************************************************/
 
     printf("\n");
@@ -1393,6 +1657,10 @@ int main(void)
     );
 
     printf(
+        " STANDALONE PRODUCTION TEST\n"
+    );
+
+    printf(
         " ZE07-CO -> MAX78000 -> ESP32-H2\n"
     );
 
@@ -1402,7 +1670,7 @@ int main(void)
 
 
     /**************************************************************************
-     * Sensor information
+     * SENSOR INFORMATION
      **************************************************************************/
 
     printf(
@@ -1436,7 +1704,28 @@ int main(void)
 
 
     /**************************************************************************
-     * Host information
+     * LED INFORMATION
+     **************************************************************************/
+
+    printf(
+        "LED GPIO:\n"
+    );
+
+    printf(
+        "  RED        : P2_0\n"
+    );
+
+    printf(
+        "  GREEN      : P2_1\n"
+    );
+
+    printf(
+        "  BLUE       : P2_2\n\n"
+    );
+
+
+    /**************************************************************************
+     * HOST INFORMATION
      **************************************************************************/
 
     printf(
@@ -1444,7 +1733,7 @@ int main(void)
     );
 
     printf(
-        "  Peripheral : UART3 / LPUART0\n"
+        "  Peripheral : UART3\n"
     );
 
     printf(
@@ -1462,17 +1751,20 @@ int main(void)
 
     printf(
         "  Host UART  : %s\n\n",
-        HOST_UART_ENABLED ? "ENABLED" : "DISABLED"
+        HOST_UART_ENABLED ?
+            "ENABLED" :
+            "DISABLED"
     );
 
 
     /**************************************************************************
-     * System time
+     * SYSTEM TIMEBASE
      **************************************************************************/
 
     printf(
         "Initializing system timebase...\n"
     );
+
 
     error =
         system_time_init();
@@ -1486,15 +1778,20 @@ int main(void)
         );
 
 
+        /*
+         * Hard failure.
+         *
+         * Blink RED forever.
+         */
         while (1) {
 
-            LED_On(LED_RED);
+            led_red_on();
 
             MXC_Delay(
                 MXC_DELAY_MSEC(250)
             );
 
-            LED_Off(LED_RED);
+            led_red_off();
 
             MXC_Delay(
                 MXC_DELAY_MSEC(250)
@@ -1509,12 +1806,52 @@ int main(void)
 
 
     /**************************************************************************
-     * Sensor UART
+     * LED INITIALIZATION
+     **************************************************************************/
+
+    printf(
+        "Initializing P2 LED GPIO...\n"
+    );
+
+
+    error =
+        leds_init();
+
+
+    if (error != E_NO_ERROR) {
+
+        printf(
+            "ERROR: LED GPIO initialization failed: %d\n",
+            error
+        );
+
+
+        while (1) {
+
+            /*
+             * We cannot trust the LED GPIO if initialization failed.
+             */
+        }
+    }
+
+
+    leds_off();
+
+
+    /*
+     * Initial BLUE indication.
+     */
+    led_blue_on();
+
+
+    /**************************************************************************
+     * SENSOR UART
      **************************************************************************/
 
     printf(
         "Initializing sensor UART2...\n"
     );
+
 
     error =
         sensor_uart_init();
@@ -1528,19 +1865,19 @@ int main(void)
         );
 
 
+        /*
+         * Sensor UART failed.
+         *
+         * Keep RED on.
+         */
+        leds_off();
+
+        led_red_on();
+
+
         while (1) {
 
-            LED_On(LED_RED);
-
-            MXC_Delay(
-                MXC_DELAY_MSEC(250)
-            );
-
-            LED_Off(LED_RED);
-
-            MXC_Delay(
-                MXC_DELAY_MSEC(250)
-            );
+            process_alive_led();
         }
     }
 
@@ -1551,7 +1888,7 @@ int main(void)
 
 
     /**************************************************************************
-     * Host UART
+     * HOST UART
      **************************************************************************/
 
 #if HOST_UART_ENABLED
@@ -1560,17 +1897,13 @@ int main(void)
         "Initializing ESP32-H2 UART3...\n"
     );
 
-#else
-
-    printf(
-        "ESP32-H2 UART3 DISABLED for this test.\n"
-    );
-
-#endif
-
 
     error =
-        host_uart_init();
+        MXC_UART_Init(
+            HOST_UART,
+            HOST_UART_BAUD,
+            MXC_UART_ERTCO_CLK
+        );
 
 
     if (error != E_NO_ERROR) {
@@ -1583,22 +1916,10 @@ int main(void)
 
         while (1) {
 
-            LED_On(LED_RED);
-
-            MXC_Delay(
-                MXC_DELAY_MSEC(100)
-            );
-
-            LED_Off(LED_RED);
-
-            MXC_Delay(
-                MXC_DELAY_MSEC(100)
-            );
+            process_alive_led();
         }
     }
 
-
-#if HOST_UART_ENABLED
 
     printf(
         "ESP32-H2 UART3 initialized successfully.\n"
@@ -1607,39 +1928,65 @@ int main(void)
 #else
 
     printf(
-        "ESP32-H2 UART3 is disabled.\n"
+        "ESP32-H2 UART3 DISABLED for this test.\n"
     );
 
 #endif
 
 
     /**************************************************************************
-     * Initial application state
+     * WATCHDOG
+     **************************************************************************/
+
+    error =
+        watchdog_init();
+
+
+    if (error != E_NO_ERROR) {
+
+        printf(
+            "ERROR: Watchdog initialization failed: %d\n",
+            error
+        );
+    }
+
+
+    /**************************************************************************
+     * APPLICATION STATE
      **************************************************************************/
 
     g_co_state =
         CO_STATE_INIT;
 
+
     g_sensor_status =
         SENSOR_STATUS_NO_DATA;
 
 
+    g_last_sensor_ms =
+        system_millis();
+
+
+    g_last_status_ms =
+        system_millis();
+
+
+    g_last_host_heartbeat_ms =
+        system_millis();
+
+
+    g_last_sensor_recovery_ms =
+        system_millis();
+
+
     /**************************************************************************
-     * NEW: Initialize RGB LEDs OFF
-     **************************************************************************/
-
-    LED_Off(LED_RED);
-    LED_Off(LED_GREEN);
-    LED_Off(LED_BLUE);
-
-
-    /**************************************************************************
-     * Clear sensor FIFO
+     * CLEAR SENSOR FIFO
      **************************************************************************/
 
     printf(
         "Clearing ZE07 UART2 RX FIFO...\n"
     );
+
 
     MXC_UART_ClearRXFIFO(
         SENSOR_UART
@@ -1652,35 +1999,16 @@ int main(void)
 
 
     /**************************************************************************
-     * Host initialization
+     * HOST STARTUP
      **************************************************************************/
 
 #if HOST_UART_ENABLED
 
     printf(
-        "Sending device information to ESP32-H2...\n"
+        "Sending device information...\n"
     );
-
-    error =
-        host_send_message(
-            MSG_DEVICE_INFO,
-            NULL,
-            0
-        );
-
-    /*
-     * We intentionally don't use this simplified message above.
-     *
-     * Send the real device info next.
-     */
-    (void)error;
-
 
     send_device_info();
-
-    printf(
-        "Device information sent.\n"
-    );
 
 
     printf(
@@ -1688,10 +2016,6 @@ int main(void)
     );
 
     send_heartbeat();
-
-    printf(
-        "Initial heartbeat sent.\n"
-    );
 
 #else
 
@@ -1721,44 +2045,79 @@ int main(void)
     );
 
     printf(
-        "Waiting for ZE07-CO frames...\n\n"
+        " BLUE LED = firmware alive heartbeat\n"
+    );
+
+    printf(
+        " RED      = sensor fault / alarm\n"
+    );
+
+    printf(
+        " GREEN    = sensor reading indication\n"
+    );
+
+    printf(
+        " Waiting for ZE07-CO frames...\n\n"
     );
 
 
     /**************************************************************************
      * MAIN LOOP
+     *
+     *
+     * NOTHING HERE IS ALLOWED TO WAIT FOREVER.
+     *
      **************************************************************************/
 
     while (1) {
 
         /*
-         * Read ZE07.
+         * 1. ALWAYS service the alive indicator first.
          *
-         * This blocks until a complete frame arrives,
-         * exactly like the known-good sensor program.
+         * This does not depend on the sensor.
          */
-        process_sensor();
+        process_alive_led();
 
 
         /*
-         * Check sensor health.
+         * 2. Process any bytes currently waiting in UART2.
+         *
+         * This is non-blocking.
+         */
+        process_sensor_uart();
+
+
+        /*
+         * 3. Check whether the sensor has stopped responding.
          */
         process_sensor_health();
 
 
         /*
-         * Host communications.
-         *
-         * Disabled completely when HOST_UART_ENABLED=0.
+         * 4. Attempt sensor recovery when required.
+         */
+        if (g_sensor_status ==
+            SENSOR_STATUS_TIMEOUT) {
+
+            sensor_uart_recover();
+        }
+
+
+        /*
+         * 5. Process ESP32 communications.
          */
         process_communications();
 
 
         /*
-         * Small delay.
+         * 6. Small scheduler delay.
+         *
+         * This is only 1 ms.
          */
         MXC_Delay(
-            MXC_DELAY_MSEC(PROCESS_PERIOD_MS)
+            MXC_DELAY_MSEC(
+                PROCESS_PERIOD_MS
+            )
         );
     }
 
